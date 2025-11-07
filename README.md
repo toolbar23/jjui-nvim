@@ -12,7 +12,7 @@ Neovim helpers for juggling multiple Jujutsu workspaces. The plugin keeps track 
   - Whether the agent terminal is open and, if it is a Codex session, the session id.
   - Layout data lives under `~/.local/state/nvim/jjws_layout_<hash>.json`.
   When you switch back, buffers re-open and the agent terminal is resumed automatically.
-- **Agent terminal** – Spawns your configured CLI helper (default `devagent`). Placement, size, and Codex session handling are configurable.
+- **Agent terminal** – Spawns your configured CLI helper (Codex by default). Placement, size, and session handling are configurable.
 - **Diff helper** – Runs `jj diff -tool difftastic`, renders the ANSI output in a read-only scratch buffer, and lets you push inline comments to the agent window.
 
 ## Setup
@@ -29,15 +29,23 @@ Override `opts` anywhere in your lazy config to tweak defaults, or skip the impo
 
 ```lua
 require("jjws").setup({
-  agent_cmd = { "bash", "-lc", "codex --repo $(pwd)" }, -- CLI to run in the agent terminal
-  agent_size = 18,             -- split size (height for top/bottom, width for left/right)
-  agent_position = "right",    -- "bottom", "top", "left", or "right"
+  agent_type = "codex",      -- derive Codex launch/resume commands automatically
+  agent_size = 40,             -- split size (height for top/bottom, width for left/right)
+  agent_position = "right",    -- "bottom", "top", "left", or "right" (default vertical split)
   diff_command = { "bash", "-lc", "jj diff -tool difftastic --color=always" }, -- command used by :JJDiff
   diff_position = "right",      -- placement for the read-only diff window
   diff_comment_prefix = "[JJDiff]", -- prefix inserted in agent comments
   remember_last = true,        -- :JJResume jumps to the most recently used workspace per repo
 })
 ```
+
+The Codex preset wires three commands for you:
+
+- `agent_cmd` – the visible terminal (`{ "bash", "-lc", "codex --repo $(pwd)" }`).
+- `agent_session_cmd` – the hidden bootstrapper (`{ "bash", "-lc", [[codex exec "say ready"]] }`).
+- `agent_resume_cmd` – the resume template (`"codex resume %s"`).
+
+Override any of them (string/list/function) when you need custom flags, or set `agent_type = nil` to supply everything yourself.
 
 Exported commands:
 
@@ -51,6 +59,18 @@ Exported commands:
 
 > **Note**  
 > The agent terminal only opens after you have explicitly selected a workspace in this Neovim session.
+
+### Suggested keymaps
+
+If you follow LazyVim's `<leader>j` convention you can wire the core entry points like so:
+
+```lua
+vim.keymap.set("n", "<leader>jw", "<cmd>JJWorkspaces<cr>", { desc = "JJ workspaces" })
+vim.keymap.set("n", "<leader>ja", "<cmd>JJAgent<cr>", { desc = "JJ agent" })
+vim.keymap.set("n", "<leader>jd", "<cmd>JJDiff<cr>", { desc = "JJ diff" })
+```
+
+Drop this in `lua/config/keymaps.lua` (LazyVim) or your general Neovim keymap file.
 
 ## Pick List Details
 
@@ -71,12 +91,12 @@ Files are only re-added if they still exist on disk. Non-file buffers (help, qui
 
 ## Agent Behavior
 
-- **Placement** – Controlled by `agent_position`. `"bottom"`/`"top"` use horizontal splits, `"left"`/`"right"` use vertical splits. `agent_size` is reused as the height or width depending on orientation (`agent_height` is still accepted for backward compatibility).
-- **Codex session workaround** – When `agent_cmd` references `codex`, the plugin:
-  1. Spawns a hidden `codex 'say ready'`.
+- **Placement** – Controlled by `agent_position`. `"bottom"`/`"top"` use horizontal splits, `"left"`/`"right"` use vertical splits. Defaults to a right-hand vertical split (`agent_size = 40`). `agent_size` is reused as the height or width depending on orientation (`agent_height` is still accepted for backward compatibility).
+- **Codex session preset** – When `agent_type = "codex"` (the default):
+  1. Runs `agent_session_cmd` (default `codex exec "say ready"`).
   2. Waits until it prints `ready`, then SIGINTs it.
   3. Parses the “To continue this session, run `codex resume <uuid>`” line and stores the session id.
-  4. Launches the visible terminal with `codex resume <uuid>`.
+  4. Launches the visible terminal via `agent_resume_cmd` (default `codex resume %s`).
   5. Adds the session id to the per-workspace layout so a subsequent restore uses `codex resume …` automatically.
 - If session creation fails (timeout or parsing error) a warning is shown and the configured command runs as-is.
 
@@ -97,7 +117,7 @@ Feel free to delete these if you want a fresh start—only runtime convenience i
 ## Troubleshooting
 
 - Run `:messages` if the picker flashes an error; all notifications are logged there.
-- If Codex sessions fail to resume, ensure `codex` is available in `$PATH` and prints the standard resume line. You can also disable the special handling by swapping `agent_cmd` to a non-Codex command.
+- If Codex sessions fail to resume, ensure `codex` is available in `$PATH` and prints the standard resume line. Disable the preset by setting `agent_type = nil` (and supplying your own `agent_cmd`).
 - When working outside a JJ repo the picker still opens but mutations (`r`, `w`, `x`, agent restore) are disabled until you select a workspace inside a repository.
 
 ## Roadmap / Ideas

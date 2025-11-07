@@ -109,6 +109,241 @@ local function workspace_config()
   return config_cache
 end
 
+local cfg = {
+  -- Emit workspace names, one per line.
+  list_cmd = [[jj workspace list -T 'name ++ "\n"']],
+  repo_root_finder = function()
+    local root = workspace_root_from_jj()
+    if root then
+      return root
+    end
+    -- Walk up for ".jj" directory
+    local uv = vim.uv or vim.loop
+    local cwd = vim.fn.getcwd()
+    local function has_jj(dir)
+      local st = uv.fs_stat(dir .. "/.jj")
+      return st and st.type == "directory"
+    end
+    local dir = cwd
+    while dir and dir ~= "/" do
+      if has_jj(dir) then
+        return dir
+      end
+      dir = vim.fn.fnamemodify(dir, ":h")
+    end
+    return cwd -- best effort
+  end,
+  close_unsaved = false, -- if true, force close without prompts
+  agent_type = "codex", -- derive codex commands automatically unless overridden
+  agent_cmd = nil, -- override to force a specific terminal command
+  agent_session_cmd = nil, -- override codex session bootstrapper
+  agent_resume_cmd = nil, -- override the resume command (accepts %s placeholder)
+  agent_size = 40, -- split size (height or width depending on position)
+  agent_position = "right", -- "bottom", "top", "left", or "right"
+  diff_command = { "bash", "-lc", "jj diff -tool difftastic --color=always" },
+  diff_position = "right",
+  diff_size = nil,
+  diff_refresh_keymap = "gr",
+  diff_comment_keymap = "gc",
+  diff_comment_prefix = "[JJDiff]",
+  remember_last = true, -- save last workspace per repo
+}
+
+local picker_ns = vim.api.nvim_create_namespace("jjws-picker")
+local agent_autocmds = {}
+local agent_buffers = {}
+local pending_agent_sessions = {}
+
+local function workspace_key(ctx)
+  if not ctx or not ctx.repo or not ctx.name then
+    return nil
+  end
+  return ctx.repo .. "::" .. ctx.name
+end
+
+local function set_default_highlight(name, opts)
+  local ok, current = pcall(vim.api.nvim_get_hl, 0, { name = name, link = false })
+  if ok and current and not vim.tbl_isempty(current) then
+    return
+  end
+  vim.api.nvim_set_hl(0, name, opts)
+end
+
+local function is_agent_buffer(buf)
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then
+    return false
+  end
+  local ok, flag = pcall(vim.api.nvim_buf_get_var, buf, "jjws_agent")
+  return ok and flag and true or false
+end
+
+local function hide_agent_buffer(buf, opts)
+  buf = buf or vim.api.nvim_get_current_buf()
+  if not is_agent_buffer(buf) then
+    return false
+  end
+  opts = opts or {}
+  local ok_key, buf_key = pcall(function()
+    return vim.b[buf].jjws_workspace_key
+  end)
+  if ok_key and buf_key then
+    agent_buffers[buf_key] = buf
+  end
+  pcall(vim.api.nvim_buf_set_option, buf, "buflisted", false)
+  pcall(vim.api.nvim_buf_set_option, buf, "bufhidden", "hide")
+  local wins = vim.fn.win_findbuf(buf)
+  for _, win in ipairs(wins) do
+    if vim.api.nvim_win_is_valid(win) then
+      vim.api.nvim_win_call(win, function()
+        pcall(vim.cmd, "stopinsert")
+      end)
+      local total_wins = #vim.api.nvim_list_wins()
+      if total_wins > 1 and not opts.keep_window then
+        pcall(vim.api.nvim_win_close, win, true)
+      else
+        vim.api.nvim_win_call(win, function()
+          vim.cmd("enew")
+        end)
+      end
+    end
+  end
+  return true
+end
+
+local function ensure_picker_highlights()
+  set_default_highlight("JJWSPickerRepo", { bold = true })
+  set_default_highlight("JJWSPickerPath", { link = "Comment" })
+  set_default_highlight("JJWSPickerStar", { bold = true })
+  set_default_highlight("JJWSPickerCursorLine", { link = "CursorLine" })
+end
+
+local function agent_abbrev_target(cmd)
+  local ok_type, cmdtype = pcall(vim.fn.getcmdtype)
+  if not ok_type or cmdtype ~= ":" then
+    return cmd
+  end
+  local ok_line, line = pcall(vim.fn.getcmdline)
+  if not ok_line then
+    return cmd
+  end
+  local pattern = string.format("^%s!?%s$", cmd, "%s*")
+  if not line:match(pattern) then
+    return cmd
+  end
+  if not is_agent_buffer(vim.api.nvim_get_current_buf()) then
+    return cmd
+  end
+  return "JJWSAgentHide"
+end
+
+local function attach_agent_autocmds(buf)
+  if type(buf) ~= "number" or buf <= 0 or not vim.api.nvim_buf_is_valid(buf) or agent_autocmds[buf] then
+    return
+  end
+  local group = vim.api.nvim_create_augroup("JJWSAgent" .. buf, { clear = true })
+  local function maybe_startinsert()
+    if not vim.api.nvim_buf_is_valid(buf) then
+      return
+    end
+    if vim.api.nvim_buf_get_option(buf, "buftype") ~= "terminal" then
+      return
+    end
+    local ok, is_agent = pcall(vim.api.nvim_buf_get_var, buf, "jjws_agent")
+    if not ok or not is_agent then
+      return
+    end
+    vim.schedule(function()
+      if vim.api.nvim_buf_is_valid(buf) then
+        pcall(vim.cmd, "startinsert")
+      end
+    end)
+  end
+  vim.api.nvim_create_autocmd({ "BufEnter", "WinEnter", "TermEnter" }, {
+    group = group,
+    buffer = buf,
+    callback = maybe_startinsert,
+  })
+  vim.api.nvim_create_autocmd("BufHidden", {
+    group = group,
+    buffer = buf,
+    callback = function()
+      local wins = vim.fn.win_findbuf(buf)
+      for _, win in ipairs(wins) do
+        if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) ~= buf then
+          pcall(vim.api.nvim_win_close, win, true)
+        end
+      end
+    end,
+  })
+  vim.api.nvim_create_autocmd("BufWipeout", {
+    group = group,
+    buffer = buf,
+    callback = function()
+      local ok_key, buf_key = pcall(function()
+        return vim.b[buf].jjws_workspace_key
+      end)
+      if ok_key and buf_key then
+        agent_buffers[buf_key] = nil
+      end
+      agent_autocmds[buf] = nil
+    end,
+  })
+  vim.api.nvim_create_autocmd("BufDelete", {
+    group = group,
+    buffer = buf,
+    callback = function()
+      local ok_key, key = pcall(function()
+        return vim.b[buf].jjws_workspace_key
+      end)
+      if ok_key and key then
+        agent_buffers[key] = nil
+        local session = nil
+        local ok_session, stored = pcall(function()
+          return vim.b[buf].jjws_codex_session
+        end)
+        if ok_session and type(stored) == "string" and stored ~= "" then
+          session = stored
+          pending_agent_sessions[key] = stored
+        end
+        local wins = vim.fn.win_findbuf(buf)
+        vim.schedule(function()
+          for _, win in ipairs(wins) do
+            if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) ~= buf then
+              pcall(vim.api.nvim_win_close, win, true)
+            end
+          end
+        end)
+        local ctx = active_workspace or current_workspace()
+        if ctx and workspace_key(ctx) == key and session then
+          vim.schedule(function()
+            open_agent({
+              session_id = session,
+              force_new = true,
+              ignore_guard = true,
+              visible = false,
+              workspace = ctx,
+            })
+          end)
+        end
+      end
+    end,
+  })
+  vim.api.nvim_create_autocmd("TermClose", {
+    group = group,
+    buffer = buf,
+    callback = function()
+      local ok_key, key = pcall(function()
+        return vim.b[buf].jjws_workspace_key
+      end)
+      if ok_key and key then
+        pending_agent_sessions[key] = nil
+        agent_buffers[key] = nil
+      end
+    end,
+  })
+  agent_autocmds[buf] = group
+end
+
 local META_KEY = "__meta"
 
 local function canonical_path(path)
@@ -132,6 +367,38 @@ local function canonical_path(path)
     end
   end
   return abs
+end
+
+local function dir_exists(path)
+  if not path or path == "" then
+    return false
+  end
+  local uv = vim.uv or vim.loop
+  local st = uv.fs_stat(path)
+  return st and st.type == "directory"
+end
+
+local function clone_cmd(cmd)
+  if type(cmd) ~= "table" then
+    return cmd
+  end
+  local copy = {}
+  for i, v in ipairs(cmd) do
+    copy[i] = v
+  end
+  return copy
+end
+
+local function normalize_system_cmd(cmd)
+  if not cmd then
+    return nil
+  end
+  if type(cmd) == "string" then
+    return { "bash", "-lc", cmd }
+  elseif type(cmd) == "table" then
+    return clone_cmd(cmd)
+  end
+  return nil
 end
 
 local function parent_dir(path)
@@ -403,11 +670,18 @@ local function collect_normal_buffers()
   return files, current_file
 end
 
-local function workspace_agent_state()
+local function workspace_agent_state(ctx)
+  local target_key = workspace_key(ctx)
   for _, buf in ipairs(vim.api.nvim_list_bufs()) do
     if vim.api.nvim_buf_is_loaded(buf) and vim.api.nvim_buf_get_option(buf, "buftype") == "terminal" then
       local ok, is_agent = pcall(vim.api.nvim_buf_get_var, buf, "jjws_agent")
       if ok and is_agent then
+        local ok_key, buf_key = pcall(function()
+          return vim.b[buf].jjws_workspace_key
+        end)
+        if target_key and buf_key ~= target_key then
+          goto continue
+        end
         local session = nil
         local ok_session, session_id = pcall(function()
           return vim.b[buf].jjws_codex_session
@@ -415,12 +689,15 @@ local function workspace_agent_state()
         if ok_session and type(session_id) == "string" and session_id ~= "" then
           session = session_id
         end
+        agent_buffers[buf_key or target_key or buf] = buf
         return {
           open = true,
           session = session,
+          buf = buf,
         }
       end
     end
+    ::continue::
   end
   return { open = false }
 end
@@ -529,10 +806,18 @@ local function ensure_diff_buffer()
 end
 
 local function find_agent_terminal()
+  local ctx = active_workspace or current_workspace()
+  local target_key = workspace_key(ctx)
   for _, buf in ipairs(vim.api.nvim_list_bufs()) do
     if vim.api.nvim_buf_is_loaded(buf) then
       local ok, is_agent = pcall(vim.api.nvim_buf_get_var, buf, "jjws_agent")
       if ok and is_agent then
+        local ok_key, buf_key = pcall(function()
+          return vim.b[buf].jjws_workspace_key
+        end)
+        if target_key and buf_key ~= target_key then
+          goto continue
+        end
         local job = nil
         local ok_job, stored = pcall(vim.api.nvim_buf_get_var, buf, "jjws_agent_job")
         if ok_job and type(stored) == "number" then
@@ -549,10 +834,15 @@ local function find_agent_terminal()
           end
         end
         if job then
+          if ok_key and buf_key then
+            agent_buffers[buf_key] = buf
+          end
+          attach_agent_autocmds(buf)
           return buf, job
         end
       end
     end
+    ::continue::
   end
   return nil, nil
 end
@@ -786,6 +1076,36 @@ diff_comment = function(opts)
   end)
 end
 
+local function format_session_command(cmd, session_id)
+  if not cmd or not session_id or session_id == "" then
+    return nil
+  end
+  local placeholder_literal = "%s"
+  local placeholder_pattern = "%%s"
+  if type(cmd) == "string" then
+    if cmd:find(placeholder_literal, 1, true) then
+      return cmd:gsub(placeholder_pattern, session_id)
+    end
+    return cmd .. " " .. session_id
+  elseif type(cmd) == "table" then
+    local out = {}
+    local replaced = false
+    for i, part in ipairs(cmd) do
+      if type(part) == "string" and part:find(placeholder_literal, 1, true) then
+        out[i] = part:gsub(placeholder_pattern, session_id)
+        replaced = true
+      else
+        out[i] = part
+      end
+    end
+    if not replaced then
+      table.insert(out, session_id)
+    end
+    return out
+  end
+  return nil
+end
+
 local function is_codex_command(cmd)
   if type(cmd) == "string" then
     return cmd:find("codex", 1, true) ~= nil
@@ -805,12 +1125,90 @@ local function build_codex_resume_command(session_id, agent_cmd)
   end
   local cmd = agent_cmd or cfg.agent_cmd
   if type(cmd) == "table" and cmd[1] == "bash" and cmd[2] == "-lc" then
-    return { "bash", "-lc", "codex resume " .. session_id }
+    return format_session_command({ "bash", "-lc", "codex resume %s" }, session_id)
   end
-  return { "codex", "resume", session_id }
+  return format_session_command({ "codex", "resume", "%s" }, session_id)
 end
 
-local function create_codex_session(cwd)
+local function resolved_agent_type()
+  local t = cfg.agent_type
+  if type(t) == "string" then
+    local normalized = trim(t):lower()
+    if normalized ~= "" then
+      return normalized
+    end
+  end
+  if cfg.agent_cmd and is_codex_command(cfg.agent_cmd) then
+    return "codex"
+  end
+  return nil
+end
+
+local function is_codex_agent()
+  return resolved_agent_type() == "codex"
+end
+
+local function resolved_agent_cmd()
+  local cmd = cfg.agent_cmd
+  if type(cmd) == "function" then
+    local ok, result = pcall(cmd)
+    if not ok then
+      notify("agent_cmd callback failed: " .. result, vim.log.levels.ERROR)
+      return nil
+    end
+    cmd = result
+  end
+  if cmd then
+    return clone_cmd(cmd)
+  end
+  local agent_type = resolved_agent_type() or "codex"
+  if agent_type == "codex" then
+    return { "bash", "-lc", "codex --repo $(pwd)" }
+  end
+  return nil
+end
+
+local function resolved_agent_session_cmd()
+  local cmd = cfg.agent_session_cmd
+  if type(cmd) == "function" then
+    local ok, result = pcall(cmd)
+    if not ok then
+      notify("agent_session_cmd callback failed: " .. result, vim.log.levels.ERROR)
+      return nil
+    end
+    cmd = result
+  end
+  if cmd then
+    return clone_cmd(cmd)
+  end
+  if is_codex_agent() then
+    return { "bash", "-lc", [[codex exec "say ready"]] }
+  end
+  return nil
+end
+
+local function build_resume_command(session_id, base_cmd)
+  if not session_id or session_id == "" then
+    return nil
+  end
+  if cfg.agent_resume_cmd then
+    if type(cfg.agent_resume_cmd) == "function" then
+      local ok, result = pcall(cfg.agent_resume_cmd, session_id, base_cmd)
+      if not ok then
+        notify("agent_resume_cmd failed: " .. result, vim.log.levels.ERROR)
+        return nil
+      end
+      return result
+    end
+    return format_session_command(cfg.agent_resume_cmd, session_id)
+  end
+  if is_codex_agent() then
+    return build_codex_resume_command(session_id, base_cmd)
+  end
+  return nil
+end
+
+local function create_codex_session(cwd, launcher_cmd)
   local uv = vim.uv or vim.loop
   if not vim.system then
     return nil, "vim.system unavailable"
@@ -819,7 +1217,10 @@ local function create_codex_session(cwd)
   local output_chunks = {}
   local session_id = nil
 
-  local launcher = { "bash", "-lc", [[codex exec "say ready"]] }
+  local launcher = normalize_system_cmd(launcher_cmd)
+  if not launcher or not launcher[1] then
+    launcher = { "bash", "-lc", [[codex exec "say ready"]] }
+  end
 
   local job = vim.system(launcher, {
     cwd = cwd,
@@ -900,6 +1301,8 @@ local function create_codex_session(cwd)
   return nil, msg
 end
 
+local revive_agent_buffer
+
 local function save_workspace_layout(ctx)
   if not ctx or not ctx.name then
     return
@@ -910,7 +1313,7 @@ local function save_workspace_layout(ctx)
   end
 
   local files, current_file = collect_normal_buffers()
-  local agent_state = workspace_agent_state()
+  local agent_state = workspace_agent_state(ctx)
 
   if current_file and vim.loop.fs_stat(current_file) ~= nil then
     local found = false
@@ -1010,52 +1413,18 @@ local function restore_workspace_layout(ctx)
   end
 
   if type(data.agent) == "table" and data.agent.open then
-    local opts = {}
-    if data.agent.session then
-      opts.session_id = data.agent.session
+    local revived = revive_agent_buffer(ctx)
+    if not revived then
+      local opts = {}
+      if data.agent.session then
+        opts.session_id = data.agent.session
+      end
+      open_agent(opts)
     end
-    open_agent(opts)
   end
 end
 
 local active_workspace = nil
-
-local cfg = {
-  -- Emit workspace names, one per line.
-  list_cmd = [[jj workspace list -T 'name ++ "\n"']],
-  repo_root_finder = function()
-    local root = workspace_root_from_jj()
-    if root then
-      return root
-    end
-    -- Walk up for ".jj" directory
-    local uv = vim.uv or vim.loop
-    local cwd = vim.fn.getcwd()
-    local function has_jj(dir)
-      local st = uv.fs_stat(dir .. "/.jj")
-      return st and st.type == "directory"
-    end
-    local dir = cwd
-    while dir and dir ~= "/" do
-      if has_jj(dir) then
-        return dir
-      end
-      dir = vim.fn.fnamemodify(dir, ":h")
-    end
-    return cwd -- best effort
-  end,
-  close_unsaved = false, -- if true, force close without prompts
-  agent_cmd = { "bash", "-lc", "devagent" }, -- replace with your CLI agent
-  agent_size = 14, -- split size (height or width depending on position)
-  agent_position = "bottom", -- "bottom", "top", "left", or "right"
-  diff_command = { "bash", "-lc", "jj diff -tool difftastic --color=always" },
-  diff_position = "right",
-  diff_size = nil,
-  diff_refresh_keymap = "gr",
-  diff_comment_keymap = "gc",
-  diff_comment_prefix = "[JJDiff]",
-  remember_last = true, -- save last workspace per repo
-}
 
 local function systemlist(cmd, cwd)
   local ok, res = pcall(function()
@@ -1095,6 +1464,8 @@ local function parse_workspace_names(lines)
   return items
 end
 
+local missing_repo_dirs_warned = {}
+
 local function collect_repo_workspaces(repo, opts)
   opts = opts or {}
   if not repo or repo == "" then
@@ -1121,19 +1492,28 @@ local function collect_repo_workspaces(repo, opts)
 
   local cwd = opts.cwd
   if cwd then
-    local lines = select(1, systemlist(cfg.list_cmd, cwd))
-    if lines then
-      local base = parent_dir(cwd)
-      for _, name in ipairs(parse_workspace_names(lines)) do
-        if not by_name[name] then
-          table.insert(items, {
-            kind = "workspace",
-            repo = repo,
-            name = name,
-            path = canonical_path(joinpath(base, name)) or joinpath(base, name),
-            managed = false,
-          })
-          by_name[name] = true
+    if not dir_exists(cwd) then
+      local key = canonical_path(cwd) or cwd
+      if key and not missing_repo_dirs_warned[key] then
+        missing_repo_dirs_warned[key] = true
+        notify(string.format("Skipping jj workspace discovery for %s (missing %s)", repo, cwd), vim.log.levels.WARN)
+      end
+    else
+      local lines = select(1, systemlist(cfg.list_cmd, cwd))
+      if lines then
+        local base = parent_dir(cwd)
+        for _, name in ipairs(parse_workspace_names(lines)) do
+          if not by_name[name] then
+            local ws_path = joinpath(base, name)
+            table.insert(items, {
+              kind = "workspace",
+              repo = repo,
+              name = name,
+              path = canonical_path(ws_path) or ws_path,
+              managed = false,
+            })
+            by_name[name] = true
+          end
         end
       end
     end
@@ -1228,6 +1608,110 @@ local function build_picker_entries()
   return entries
 end
 
+local function format_picker_lines(entries)
+  entries = entries or {}
+  local indent = "  "
+  local prefix_pad = " "
+  local repo_icon = " "
+  local branch_mid = "├─ "
+  local branch_last = "└─ "
+  local workspace_label_width = 0
+  local workspace_cache = {}
+  for idx, entry in ipairs(entries) do
+    if entry.kind == "workspace" then
+      local next_entry = entries[idx + 1]
+      local is_last = not next_entry or next_entry.kind == "repo" or next_entry.repo ~= entry.repo
+      local connector = indent .. (is_last and branch_last or branch_mid)
+      local name = entry.name or ""
+      local node_icon = entry.is_current and " " or " "
+      local star = entry.is_current and " *" or ""
+      local label = connector .. node_icon .. name .. star
+      workspace_label_width = math.max(workspace_label_width, vim.api.nvim_strwidth(label))
+      workspace_cache[idx] = {
+        label = label,
+        star = star,
+      }
+    end
+  end
+  local path_col = workspace_label_width > 0 and (workspace_label_width + 2) or 0
+  local lines = {}
+  local highlights = {}
+  local max_width = 0
+  local pad_len = #prefix_pad
+  local function add_line(text, segments)
+    local final = prefix_pad .. text
+    if segments then
+      for _, seg in ipairs(segments) do
+        if seg.start_col then
+          seg.start_col = seg.start_col + pad_len
+        end
+        if seg.end_col then
+          seg.end_col = seg.end_col + pad_len
+        end
+      end
+    end
+    table.insert(lines, final)
+    highlights[#lines] = segments
+    max_width = math.max(max_width, vim.api.nvim_strwidth(final))
+  end
+  for idx, entry in ipairs(entries) do
+    if entry.kind == "repo" then
+      local suffix = entry.managed and "" or " [unregistered]"
+      local text = repo_icon .. entry.repo .. "/" .. suffix
+      local icon_len = #repo_icon
+      add_line(text, {
+        { hl = "JJWSPickerRepo", start_col = icon_len, end_col = #text },
+      })
+    elseif entry.kind == "workspace" then
+      local cached = workspace_cache[idx]
+      local label = cached and cached.label or ""
+      if label == "" then
+        local next_entry = entries[idx + 1]
+        local is_last = not next_entry or next_entry.kind == "repo" or next_entry.repo ~= entry.repo
+        local connector = indent .. (is_last and branch_last or branch_mid)
+        local node_icon = entry.is_current and " " or " "
+        local star = entry.is_current and " *" or ""
+        local name = entry.name or ""
+        label = connector .. node_icon .. name .. star
+        cached = { star = star }
+      end
+      local path = entry.path or ""
+      local line_text = label
+      local path_start_col
+      if path ~= "" then
+        if path_col > 0 then
+          local pad = path_col - vim.api.nvim_strwidth(label)
+          if pad < 1 then
+            pad = 1
+          end
+          local spacer = string.rep(" ", pad)
+          line_text = label .. spacer .. path
+          path_start_col = #label + #spacer
+        else
+          line_text = label .. " " .. path
+          path_start_col = #label + 1
+        end
+      end
+      local segments = {}
+      if cached and cached.star and cached.star ~= "" then
+        local star_start = #label - 1
+        if star_start >= 0 then
+          table.insert(segments, { hl = "JJWSPickerStar", start_col = star_start, end_col = #label })
+        end
+      end
+      if path_start_col then
+        table.insert(segments, { hl = "JJWSPickerPath", start_col = path_start_col, end_col = #line_text })
+      end
+      add_line(line_text, segments)
+    end
+  end
+  if #lines == 0 then
+    lines = { prefix_pad .. "(no workspaces configured)" }
+    max_width = vim.api.nvim_strwidth(lines[1])
+  end
+  return lines, max_width, highlights
+end
+
 local picker_state = {}
 
 local function close_picker()
@@ -1244,27 +1728,21 @@ local function render_picker()
   if not picker_state.buf or not vim.api.nvim_buf_is_valid(picker_state.buf) then
     return
   end
-  local lines = {}
-  for _, entry in ipairs(picker_state.entries or {}) do
-    if entry.kind == "repo" then
-      local suffix = entry.managed and "" or " [unregistered]"
-      table.insert(lines, "  " .. entry.repo .. "/" .. suffix)
-    elseif entry.kind == "workspace" then
-      local label = entry.name
-      local path = entry.path or ""
-      local prefix = "  "
-      if entry.is_current then
-        prefix = "→ "
-      end
-      table.insert(lines, string.format("%s%-12s %s", prefix, label, path))
-    end
-  end
-  if #lines == 0 then
-    lines = { "(no workspaces configured)" }
-  end
+  ensure_picker_highlights()
+  local lines, _, highlights = format_picker_lines(picker_state.entries)
   vim.api.nvim_buf_set_option(picker_state.buf, "modifiable", true)
   vim.api.nvim_buf_set_lines(picker_state.buf, 0, -1, false, lines)
   vim.api.nvim_buf_set_option(picker_state.buf, "modifiable", false)
+  vim.api.nvim_buf_clear_namespace(picker_state.buf, picker_ns, 0, -1)
+  for idx, segments in ipairs(highlights or {}) do
+    if segments then
+      for _, seg in ipairs(segments) do
+        if seg and seg.start_col and seg.end_col and seg.start_col < seg.end_col then
+          pcall(vim.api.nvim_buf_add_highlight, picker_state.buf, picker_ns, seg.hl, idx - 1, seg.start_col, seg.end_col)
+        end
+      end
+    end
+  end
 end
 
 local function find_entry_index(target)
@@ -1338,18 +1816,8 @@ local function open_picker_window()
   vim.api.nvim_buf_set_option(buf, "swapfile", false)
   vim.api.nvim_buf_set_option(buf, "filetype", "jjws")
 
-  local width = 0
-  for _, entry in ipairs(picker_state.entries) do
-    local text
-    if entry.kind == "repo" then
-      local suffix = entry.managed and "" or " [unregistered]"
-      text = entry.repo .. "/" .. suffix
-    else
-      text = string.format("  %-12s %s", entry.name, entry.path or "")
-    end
-    width = math.max(width, vim.api.nvim_strwidth(text))
-  end
-  width = math.min(math.max(width + 2, 30), math.floor(vim.o.columns * 0.8))
+  local _, max_line_width = format_picker_lines(picker_state.entries)
+  local width = math.min(math.max(max_line_width + 2, 30), math.floor(vim.o.columns * 0.8))
   local height = math.min(#picker_state.entries + 2, math.floor(vim.o.lines * 0.6))
   if height < 3 then
     height = 3
@@ -1366,6 +1834,8 @@ local function open_picker_window()
     width = width,
     height = height,
   })
+  vim.api.nvim_win_set_option(picker_state.win, "cursorline", true)
+  vim.api.nvim_win_set_option(picker_state.win, "winhighlight", "CursorLine:JJWSPickerCursorLine")
 
   render_picker()
   local idx = active_idx or 1
@@ -1558,14 +2028,19 @@ local function wipe_all()
   local bufs = vim.api.nvim_list_bufs()
   for _, b in ipairs(bufs) do
     if vim.api.nvim_buf_is_loaded(b) then
-      local modified = vim.bo[b].modified
-      if cfg.close_unsaved or not modified then
-        pcall(vim.api.nvim_buf_delete, b, { force = cfg.close_unsaved })
+      if is_agent_buffer(b) then
+        hide_agent_buffer(b, { keep_window = true })
+      else
+        local modified = vim.bo[b].modified
+        if cfg.close_unsaved or not modified then
+          pcall(vim.api.nvim_buf_delete, b, { force = cfg.close_unsaved })
+        end
       end
     end
   end
   -- Ensure a clean tabpage
   vim.cmd("tabonly")
+  pcall(vim.cmd, "only")
 end
 
 local function set_cwd(path)
@@ -1579,15 +2054,8 @@ local function set_cwd(path)
   notify("cwd → " .. path)
 end
 
-open_agent = function(opts)
-  -- Open a terminal split and start the configured agent in repo cwd
-  opts = opts or {}
-  if not active_workspace and not opts.ignore_guard then
-    notify("open a JJ workspace before starting the agent", vim.log.levels.WARN)
-    return nil
-  end
-  local cwd = vim.fn.getcwd()
-  local size = cfg.agent_size or cfg.agent_height or 14
+local function create_agent_split()
+  local size = cfg.agent_size or cfg.agent_height or 40
   local position = cfg.agent_position
   if not position or position == "" then
     -- backward compatibility with deprecated agent_direction
@@ -1611,32 +2079,129 @@ open_agent = function(opts)
     cmd = string.format("botright %d split", size)
   end
   vim.cmd(cmd)
+  return vim.api.nvim_get_current_win()
+end
+
+local function focus_agent_window(buf)
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then
+    return false
+  end
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf then
+      vim.api.nvim_set_current_win(win)
+      attach_agent_autocmds(buf)
+      pcall(vim.cmd, "startinsert")
+      return true
+    end
+  end
+  return false
+end
+
+local function place_agent_buffer(buf)
+  local win = create_agent_split()
+  vim.api.nvim_win_set_buf(win, buf)
+  pcall(vim.api.nvim_buf_set_option, buf, "buflisted", false)
+  pcall(vim.api.nvim_buf_set_option, buf, "bufhidden", "hide")
+  pcall(vim.api.nvim_buf_set_option, buf, "swapfile", false)
+  attach_agent_autocmds(buf)
+  pcall(vim.cmd, "startinsert")
+  return buf
+end
+
+revive_agent_buffer = function(ctx)
+  local key = workspace_key(ctx)
+  if not key then
+    return nil
+  end
+  local buf = agent_buffers[key]
+  if buf and vim.api.nvim_buf_is_valid(buf) then
+    vim.b[buf].jjws_workspace_key = key
+    if not focus_agent_window(buf) then
+      return place_agent_buffer(buf)
+    end
+    return buf
+  end
+  agent_buffers[key] = nil
+  local pending = pending_agent_sessions[key]
+  if pending then
+    pending_agent_sessions[key] = nil
+    return open_agent({
+      workspace = ctx,
+      session_id = pending,
+      force_new = true,
+      ignore_guard = true,
+      visible = false,
+    })
+  end
+  return nil
+end
+
+open_agent = function(opts)
+  -- Open a terminal split and start the configured agent in repo cwd
+  opts = opts or {}
+  local ctx = opts.workspace or active_workspace or current_workspace()
+  if not ctx and not opts.ignore_guard then
+    notify("open a JJ workspace before starting the agent", vim.log.levels.WARN)
+    return nil
+  end
+  if not opts.force_new then
+    local revived = revive_agent_buffer(ctx)
+    if revived then
+      return revived
+    end
+  end
+  local cwd = (ctx and ctx.root) or vim.fn.getcwd()
+  local win = create_agent_split()
   vim.cmd("enew")
   local buf = vim.api.nvim_get_current_buf()
   vim.b[buf].jjws_agent = true
+  pcall(vim.api.nvim_buf_set_option, buf, "buflisted", false)
+  pcall(vim.api.nvim_buf_set_option, buf, "bufhidden", "hide")
+  pcall(vim.api.nvim_buf_set_option, buf, "swapfile", false)
+  pcall(vim.api.nvim_buf_set_option, buf, "filetype", "jjws-agent")
+  attach_agent_autocmds(buf)
+  local key = workspace_key(ctx)
+  if key then
+    vim.b[buf].jjws_workspace_key = key
+    agent_buffers[key] = buf
+  end
   local session_id = opts.session_id
-  local term_cmd = cfg.agent_cmd
-  if session_id and session_id ~= "" and is_codex_command(cfg.agent_cmd) then
-    local resume_cmd = build_codex_resume_command(session_id, cfg.agent_cmd)
+  local base_cmd = resolved_agent_cmd()
+  if not base_cmd then
+    notify("configure jjws.agent_cmd or jjws.agent_type", vim.log.levels.ERROR)
+    return nil
+  end
+  local term_cmd = base_cmd
+  if session_id and session_id ~= "" then
+    local resume_cmd = build_resume_command(session_id, base_cmd)
     if resume_cmd then
       term_cmd = resume_cmd
     end
-  elseif not session_id and is_codex_command(cfg.agent_cmd) then
-    local session, err = create_codex_session(cwd)
+  elseif is_codex_agent() then
+    local session_cmd = resolved_agent_session_cmd()
+    local session, err = create_codex_session(cwd, session_cmd)
     if session then
       session_id = session
-      local resume_cmd = build_codex_resume_command(session_id, cfg.agent_cmd)
+      local resume_cmd = build_resume_command(session_id, base_cmd)
       if resume_cmd then
         term_cmd = resume_cmd
         notify("codex session " .. session_id .. " ready", vim.log.levels.DEBUG)
       end
-    else
-      notify("codex session setup failed: " .. (err or "unknown error"), vim.log.levels.WARN)
+    elseif err then
+      notify("codex session setup failed: " .. err, vim.log.levels.WARN)
     end
   end
 
   local job_id = vim.fn.termopen(term_cmd, { cwd = cwd })
-  vim.cmd("startinsert")
+  if opts.visible ~= false then
+    vim.cmd("startinsert")
+  else
+    vim.schedule(function()
+      if win and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf then
+        pcall(vim.api.nvim_win_close, win, true)
+      end
+    end)
+  end
   if type(job_id) == "number" and job_id > 0 then
     pcall(vim.api.nvim_buf_set_var, buf, "jjws_agent_job", job_id)
   end
@@ -1647,7 +2212,6 @@ open_agent = function(opts)
   end
 
   -- Persist the updated layout so the agent/session are recorded immediately.
-  local ctx = active_workspace or current_workspace()
   if ctx then
     save_workspace_layout(ctx)
   end
@@ -1759,6 +2323,16 @@ end
 
 function M.setup(opts)
   cfg = vim.tbl_deep_extend("force", cfg, opts or {})
+  vim.api.nvim_create_user_command("JJWSAgentHide", function(o)
+    if hide_agent_buffer() then
+      return
+    end
+    if o.bang then
+      vim.cmd("bdelete!")
+    else
+      vim.cmd("bdelete")
+    end
+  end, { bang = true })
   vim.api.nvim_create_user_command("JJWorkspaces", function()
     M.pick_workspace()
   end, {})
@@ -1798,6 +2372,22 @@ function M.setup(opts)
       end
     end,
   })
+
+  for _, name in ipairs({ "bdelete", "Bdelete", "bd", "Bd" }) do
+    vim.cmd(string.format(
+      "cnoreabbrev <expr> %s luaeval(\"require('jjws')._agent_abbrev('%s')\")",
+      name,
+      name
+    ))
+  end
+end
+
+function M._agent_abbrev(cmd)
+  local ok, res = pcall(agent_abbrev_target, cmd)
+  if not ok then
+    return cmd
+  end
+  return res
 end
 
 return M
