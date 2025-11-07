@@ -17,6 +17,16 @@ Neovim helpers for juggling multiple Jujutsu workspaces. The plugin keeps track 
 
 ## Setup
 
+With lazy.nvim (LazyVim et al.), import the bundled spec:
+
+```lua
+return {
+  { import = "jjws.lazy" },
+}
+```
+
+Override `opts` anywhere in your lazy config to tweak defaults, or skip the import and call `setup` manually:
+
 ```lua
 require("jjws").setup({
   agent_cmd = { "bash", "-lc", "codex --repo $(pwd)" }, -- CLI to run in the agent terminal
