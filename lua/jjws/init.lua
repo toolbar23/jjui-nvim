@@ -155,6 +155,8 @@ local cfg = {
   agent_prompt_patterns = nil, -- optional list of Lua patterns to detect prompts
 }
 
+local uv = vim.uv or vim.loop
+
 local picker_ns = vim.api.nvim_create_namespace("jjws-picker")
 local ui_state = {
   initial_restored = false,
@@ -166,6 +168,8 @@ local agent_buffers = {}
 local agent_sizes = {}
 local pending_agent_sessions = {}
 local workspace_attention = {}
+local owned_workspace_lock = nil
+local current_pid = (uv and uv.os_getpid and uv.os_getpid()) or vim.fn.getpid()
 
 local AGENT_IDLE_FALLBACK = 600
 local agent_output_watchers = {}
@@ -717,6 +721,7 @@ local function ensure_picker_highlights()
   set_default_highlight("JJWSPickerPath", { link = "Comment" })
   set_default_highlight("JJWSPickerStar", { bold = true })
   set_default_highlight("JJWSPickerAttention", { link = "WarningMsg" })
+  set_default_highlight("JJWSPickerLocked", { link = "WarningMsg" })
   set_default_highlight("JJWSPickerCursorLine", { link = "CursorLine" })
 end
 
@@ -1146,7 +1151,7 @@ local function repo_any_path(repo)
   return nil
 end
 
-local function workspace_layout_path(repo_path, workspace_name, workspace_root)
+local function workspace_state_key(repo_path, workspace_name, workspace_root)
   if not workspace_name or workspace_name == "" then
     return nil
   end
@@ -1155,7 +1160,253 @@ local function workspace_layout_path(repo_path, workspace_name, workspace_root)
     base = workspace_name
   end
   local key = base .. "::" .. workspace_name
-  return vim.fn.stdpath("state") .. "/jjws_layout_" .. vim.fn.sha256(key) .. ".json"
+  return vim.fn.sha256(key)
+end
+
+local function workspace_layout_path(repo_path, workspace_name, workspace_root)
+  local state_key = workspace_state_key(repo_path, workspace_name, workspace_root)
+  if not state_key then
+    return nil
+  end
+  return vim.fn.stdpath("state") .. "/jjws_layout_" .. state_key .. ".json"
+end
+
+local function workspace_lock_path(repo_path, workspace_name, workspace_root)
+  local state_key = workspace_state_key(repo_path, workspace_name, workspace_root)
+  if not state_key then
+    return nil
+  end
+  return vim.fn.stdpath("state") .. "/jjws_lock_" .. state_key .. ".lock"
+end
+
+local function safe_unlink(path)
+  if not path or path == "" then
+    return
+  end
+  local ok = false
+  if uv and uv.fs_unlink then
+    local success = pcall(uv.fs_unlink, path)
+    if success then
+      ok = true
+    end
+  end
+  if not ok then
+    pcall(os.remove, path)
+  end
+end
+
+local function normalize_workspace_ref(ws)
+  if type(ws) ~= "table" then
+    return nil
+  end
+  if not ws.name or ws.name == "" then
+    return nil
+  end
+  local root = ws.root or ws.path
+  if not root or root == "" then
+    return nil
+  end
+  local canonical_root = canonical_path(root) or root
+  local repo_path = ws.repo_path or repo_storage_path(canonical_root)
+  return {
+    repo = ws.repo,
+    name = ws.name,
+    root = canonical_root,
+    repo_path = repo_path,
+    detached = ws.detached or false,
+  }
+end
+
+local function read_workspace_lock(path)
+  if not path or path == "" then
+    return nil
+  end
+  local f = io.open(path, "r")
+  if not f then
+    return nil
+  end
+  local ok, data = pcall(vim.json.decode, f:read("*a"))
+  f:close()
+  if not ok or type(data) ~= "table" then
+    return nil
+  end
+  data.pid = tonumber(data.pid)
+  return data
+end
+
+local function pid_alive(pid)
+  if type(pid) ~= "number" or pid <= 0 then
+    return false
+  end
+  if not (uv and uv.kill) then
+    return true
+  end
+  local ok = pcall(uv.kill, pid, 0)
+  return ok
+end
+
+local function proc_name(pid)
+  if type(pid) ~= "number" or pid <= 0 then
+    return nil
+  end
+  local comm_path = string.format("/proc/%d/comm", pid)
+  local f = io.open(comm_path, "r")
+  if not f then
+    return nil
+  end
+  local name = trim(f:read("*l") or "")
+  f:close()
+  if name == "" then
+    return nil
+  end
+  return name
+end
+
+local function lock_is_stale(info)
+  if type(info) ~= "table" then
+    return true
+  end
+  local pid = tonumber(info.pid)
+  if not pid or pid <= 0 then
+    return true
+  end
+  if not pid_alive(pid) then
+    return true
+  end
+  local name = proc_name(pid)
+  if name and name ~= "" then
+    local lowered = name:lower()
+    if not lowered:find("nvim", 1, true) then
+      return true
+    end
+  end
+  return false
+end
+
+local function workspace_lock_status(ref)
+  if not ref then
+    return { locked = false }
+  end
+  local path = workspace_lock_path(ref.repo_path, ref.name, ref.root)
+  if not path then
+    return { locked = false }
+  end
+  local info = read_workspace_lock(path)
+  if not info then
+    return { locked = false, path = path }
+  end
+  if info.pid == current_pid then
+    return { locked = false, path = path, owned = true, info = info }
+  end
+  if lock_is_stale(info) then
+    safe_unlink(path)
+    return { locked = false, path = path, stale = true }
+  end
+  return { locked = true, path = path, info = info }
+end
+
+local function write_workspace_lock(path, payload)
+  if not path or path == "" then
+    return false
+  end
+  local dir = vim.fn.fnamemodify(path, ":h")
+  vim.fn.mkdir(dir, "p")
+  local f = io.open(path, "w")
+  if not f then
+    return false
+  end
+  local ok, encoded = pcall(vim.json.encode, payload)
+  if not ok then
+    f:close()
+    return false
+  end
+  f:write(encoded)
+  f:close()
+  return true
+end
+
+local function acquire_workspace_lock(ctx)
+  local ref = normalize_workspace_ref(ctx)
+  if not ref or ref.detached then
+    return true
+  end
+  local status = workspace_lock_status(ref)
+  if status.locked then
+    return false, status
+  end
+  local path = status.path
+  if not path then
+    return true
+  end
+  local payload = {
+    pid = current_pid,
+    repo = ref.repo,
+    name = ref.name,
+    root = ref.root,
+    timestamp = os.time(),
+  }
+  local ok = write_workspace_lock(path, payload)
+  if not ok then
+    return false
+  end
+  owned_workspace_lock = { path = path }
+  return true
+end
+
+local function release_workspace_lock()
+  if not owned_workspace_lock or not owned_workspace_lock.path then
+    return
+  end
+  safe_unlink(owned_workspace_lock.path)
+  owned_workspace_lock = nil
+end
+
+local function maybe_handle_locked_workspace(ws, opts)
+  opts = opts or {}
+  if not ws or ws.detached then
+    return true
+  end
+  local ref = normalize_workspace_ref(ws)
+  if not ref then
+    return true
+  end
+  ws.path = ref.root
+  ws.repo_path = ref.repo_path
+  local status = workspace_lock_status(ref)
+  if not status.locked then
+    return true
+  end
+  if opts.allow_prompt == false then
+    ws.detached = true
+    notify(
+      string.format(
+        "%s locked by pid %s; running in detached edit-only mode",
+        workspace_label(ws),
+        status.info and status.info.pid or "?"
+      ),
+      vim.log.levels.WARN
+    )
+    return true
+  end
+  local owner_pid = status.info and status.info.pid or "?"
+  local message = string.format(
+    "Workspace '%s' is locked by PID %s.\nChoose an action:",
+    workspace_label(ws),
+    owner_pid
+  )
+  local choice = vim.fn.confirm(message, "&Cancel\n&Open without agent", 1)
+  if choice ~= 2 then
+    if opts.on_cancel then
+      opts.on_cancel()
+    end
+    return false
+  end
+  ws.detached = true
+  notify(
+    string.format("%s opened without agent/layout (detached).", workspace_label(ws)),
+    vim.log.levels.WARN
+  )
+  return true
 end
 
 local function collect_normal_buffers()
@@ -1833,7 +2084,7 @@ local revive_agent_buffer
 local ensure_initial_restore
 
 local function save_workspace_layout(ctx)
-  if not ctx or not ctx.name then
+  if not ctx or ctx.detached or not ctx.name then
     return
   end
   local layout_path = workspace_layout_path(ctx.repo_path, ctx.name, ctx.root)
@@ -1899,7 +2150,7 @@ local function save_workspace_layout(ctx)
 end
 
 local function restore_workspace_layout(ctx)
-  if not ctx or not ctx.name then
+  if not ctx or ctx.detached or not ctx.name then
     return
   end
   local layout_path = workspace_layout_path(ctx.repo_path, ctx.name, ctx.root)
@@ -1993,8 +2244,22 @@ ensure_initial_restore = function()
   ui_state.initial_restored = true
   local ok, ctx = pcall(current_workspace)
   if ok and ctx then
+    ctx.path = ctx.root
     active_workspace = ctx
-    restore_workspace_layout(ctx)
+    maybe_handle_locked_workspace(ctx, { allow_prompt = false })
+    if not ctx.detached then
+      local lock_ok = acquire_workspace_lock(ctx)
+      if not lock_ok then
+        ctx.detached = true
+        notify(
+          string.format("%s locked elsewhere; running detached.", workspace_label(ctx)),
+          vim.log.levels.WARN
+        )
+      end
+    end
+    if not ctx.detached then
+      restore_workspace_layout(ctx)
+    end
   end
 end
 
@@ -2045,6 +2310,7 @@ local function collect_repo_workspaces(repo, opts)
   end
   local items = {}
   local by_name = {}
+  local repo_path = opts.repo_path
   local repo_cfg = repo_entry(repo)
   if repo_cfg then
     for name, info in pairs(repo_cfg) do
@@ -2056,6 +2322,7 @@ local function collect_repo_workspaces(repo, opts)
           name = name,
           path = path,
           managed = true,
+          repo_path = repo_path or info.repo_path,
         })
         by_name[name] = true
       end
@@ -2083,6 +2350,7 @@ local function collect_repo_workspaces(repo, opts)
               name = name,
               path = canonical_path(ws_path) or ws_path,
               managed = false,
+              repo_path = repo_path,
             })
             by_name[name] = true
           end
@@ -2155,7 +2423,7 @@ local function build_picker_entries()
       repo_path = repo_path,
     })
 
-    local workspaces = collect_repo_workspaces(repo, { cwd = cwd })
+    local workspaces = collect_repo_workspaces(repo, { cwd = cwd, repo_path = repo_path })
     if (not managed) and ctx and ctx.repo == repo and #workspaces == 0 and ctx.root then
       workspaces = {
         {
@@ -2166,16 +2434,30 @@ local function build_picker_entries()
           managed = false,
           is_current = true,
           needs_attention = workspace_has_attention(repo, "default"),
+          repo_path = repo_path or ctx.repo_path,
         },
       }
     end
     for _, ws in ipairs(workspaces) do
+      ws.repo_path = ws.repo_path or repo_path
       if ctx and ctx.repo == repo then
         local canonical = canonical_path(ws.path)
         local is_current = canonical and canonical == ctx.root
         ws.is_current = is_current
       end
       ws.needs_attention = workspace_has_attention(ws.repo, ws.name)
+      if not ws.is_current then
+        local ref = normalize_workspace_ref({
+          repo = ws.repo,
+          name = ws.name,
+          path = ws.path,
+          repo_path = ws.repo_path,
+        })
+        local status = workspace_lock_status(ref)
+        ws.locked = status and status.locked or false
+      else
+        ws.locked = false
+      end
       table.insert(entries, ws)
     end
   end
@@ -2224,32 +2506,25 @@ local function format_picker_lines(entries)
   local path_col = workspace_label_width > 0 and (workspace_label_width + 2) or 0
   local lines = {}
   local highlights = {}
+  local line_defs = {}
   local max_width = 0
+  local max_pre_status_width = 0
   local pad_len = #prefix_pad
-  local function add_line(text, segments)
-    local final = prefix_pad .. text
-    if segments then
-      for _, seg in ipairs(segments) do
-        if seg.start_col then
-          seg.start_col = seg.start_col + pad_len
-        end
-        if seg.end_col then
-          seg.end_col = seg.end_col + pad_len
-        end
-      end
+  local function queue_line(text, segments, entry)
+    table.insert(line_defs, { text = text, segments = segments or {}, entry = entry })
+    local width = vim.api.nvim_strwidth(prefix_pad .. text)
+    if width > max_pre_status_width then
+      max_pre_status_width = width
     end
-    table.insert(lines, final)
-    highlights[#lines] = segments
-    max_width = math.max(max_width, vim.api.nvim_strwidth(final))
   end
   for idx, entry in ipairs(entries) do
     if entry.kind == "repo" then
       local suffix = entry.managed and "" or " [unregistered]"
       local text = repo_icon .. entry.repo .. "/" .. suffix
       local icon_len = #repo_icon
-      add_line(text, {
+      queue_line(text, {
         { hl = "JJWSPickerRepo", start_col = icon_len, end_col = #text },
-      })
+      }, entry)
     elseif entry.kind == "workspace" then
       local cached = workspace_cache[idx]
       local label = cached and cached.label or ""
@@ -2313,12 +2588,50 @@ local function format_picker_lines(entries)
       if path_start_col then
         table.insert(segments, { hl = "JJWSPickerPath", start_col = path_start_col, end_col = #line_text })
       end
-      add_line(line_text, segments)
+      queue_line(line_text, segments, entry)
     end
   end
-  if #lines == 0 then
-    lines = { prefix_pad .. "(no workspaces configured)" }
+  if #line_defs == 0 then
+    local text = "(no workspaces configured)"
+    table.insert(lines, prefix_pad .. text)
     max_width = vim.api.nvim_strwidth(lines[1])
+    return lines, max_width, highlights
+  end
+  local status_col = max_pre_status_width > 0 and (max_pre_status_width + 2) or 0
+  for _, def in ipairs(line_defs) do
+    local text = def.text
+    local segments = def.segments or {}
+    local entry = def.entry
+    if entry and entry.kind == "workspace" and entry.locked and not entry.is_current then
+      local marker = "(!locked)"
+      local current_width = vim.api.nvim_strwidth(prefix_pad .. text)
+      local pad = status_col - current_width
+      if pad < 1 then
+        pad = 1
+      end
+      local spacer = string.rep(" ", pad)
+      local start_col = #text + #spacer
+      text = text .. spacer .. marker
+      table.insert(segments, {
+        hl = "JJWSPickerLocked",
+        start_col = start_col,
+        end_col = start_col + #marker,
+      })
+    end
+    if segments then
+      for _, seg in ipairs(segments) do
+        if seg.start_col then
+          seg.start_col = seg.start_col + pad_len
+        end
+        if seg.end_col then
+          seg.end_col = seg.end_col + pad_len
+        end
+      end
+    end
+    local final = prefix_pad .. text
+    table.insert(lines, final)
+    highlights[#lines] = segments
+    max_width = math.max(max_width, vim.api.nvim_strwidth(final))
   end
   return lines, max_width, highlights
 end
@@ -2518,14 +2831,27 @@ local function switch_from_picker(entry)
         name = basename ~= "" and basename or "default"
       end
     end
-    close_picker()
-    M.use_workspace({ name = name, path = canonical })
+    local ok = M.use_workspace({ name = name, path = canonical, repo = repo })
+    if ok then
+      close_picker()
+    else
+      ensure_picker_open()
+    end
     return
   end
 
   if entry.kind == "workspace" then
-    close_picker()
-    M.use_workspace({ name = entry.name, path = entry.path })
+    local ok = M.use_workspace({
+      name = entry.name,
+      path = entry.path,
+      repo = entry.repo,
+      repo_path = entry.repo_path,
+    })
+    if ok then
+      close_picker()
+    else
+      ensure_picker_open()
+    end
   end
 end
 
@@ -2730,6 +3056,9 @@ local function place_agent_buffer(buf, key)
 end
 
 revive_agent_buffer = function(ctx)
+  if ctx and ctx.detached then
+    return nil
+  end
   local key = workspace_key(ctx)
   if not key then
     return nil
@@ -2765,6 +3094,10 @@ open_agent = function(opts)
   local ctx = opts.workspace or active_workspace or current_workspace()
   if not ctx and not opts.ignore_guard then
     notify("open a JJ workspace before starting the agent", vim.log.levels.WARN)
+    return nil
+  end
+  if ctx and ctx.detached then
+    notify("workspace is in detached mode; agent disabled", vim.log.levels.WARN)
     return nil
   end
   if not opts.force_new then
@@ -2906,30 +3239,70 @@ function M.pick_workspace()
   end
 end
 
-function M.use_workspace(ws)
+function M.use_workspace(ws, opts)
   -- 1) wipe UI state  2) chdir  3) reopen an empty buffer  4) save state
-  local previous = current_workspace()
-  if previous then
+  opts = opts or {}
+  if not ws or not ws.path then
+    notify("workspace path missing", vim.log.levels.ERROR)
+    return false
+  end
+  if not ws.name or ws.name == "" then
+    ws.name = vim.fn.fnamemodify(ws.path, ":t")
+  end
+  if not maybe_handle_locked_workspace(ws, { on_cancel = opts.on_cancel }) then
+    return false
+  end
+  local previous = active_workspace or current_workspace()
+  if previous and not previous.detached then
     save_workspace_layout(previous)
+  end
+  if not (previous and previous.detached) then
+    release_workspace_lock()
   end
   wipe_all()
   set_cwd(ws.path)
   vim.cmd("enew")
   local new_ctx = current_workspace()
   if new_ctx then
+    new_ctx.detached = ws.detached or false
+    if ws.repo and ws.repo ~= "" then
+      new_ctx.repo = ws.repo
+    end
+    if ws.repo_path then
+      new_ctx.repo_path = ws.repo_path
+    end
     active_workspace = new_ctx
-    restore_workspace_layout(new_ctx)
-    local cleared, state = clear_workspace_attention(new_ctx)
-    if cleared then
-      local message = (state and state.message) or string.format("agent has finished in %s", workspace_label(new_ctx))
-      notify(message)
+    if not new_ctx.detached then
+      local lock_ok = acquire_workspace_lock(new_ctx)
+      if not lock_ok then
+        new_ctx.detached = true
+        notify(
+          string.format("%s locked elsewhere; continuing without agent/layout.", workspace_label(new_ctx)),
+          vim.log.levels.WARN
+        )
+      end
+    end
+    if not new_ctx.detached then
+      restore_workspace_layout(new_ctx)
+      local cleared, state = clear_workspace_attention(new_ctx)
+      if cleared then
+        local message = (state and state.message) or string.format("agent has finished in %s", workspace_label(new_ctx))
+        notify(message)
+      end
+    else
+      notify(
+        string.format("%s is in detached edit-only mode.", workspace_label(new_ctx)),
+        vim.log.levels.WARN
+      )
     end
   else
     active_workspace = nil
   end
   local repo_root = cfg.repo_root_finder()
-  save_last(repo_root, ws)
-  notify("workspace → " .. ws.name)
+  local snapshot = new_ctx and workspace_snapshot(new_ctx)
+  save_last(repo_root, snapshot or ws)
+  notify("workspace → " .. (new_ctx and workspace_label(new_ctx) or ws.name))
+  return new_ctx ~= nil
 end
 
 function M.diff(opts)
@@ -2999,10 +3372,17 @@ function M.setup(opts)
   end, {})
   vim.api.nvim_create_autocmd("VimLeavePre", {
     callback = function()
-      local ok, ctx = pcall(current_workspace)
-      if ok and ctx then
+      local ctx = active_workspace
+      if not ctx then
+        local ok, current = pcall(current_workspace)
+        if ok then
+          ctx = current
+        end
+      end
+      if ctx then
         save_workspace_layout(ctx)
       end
+      release_workspace_lock()
     end,
   })
 

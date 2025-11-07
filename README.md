@@ -89,6 +89,14 @@ Every workspace switch triggers:
 
 Files are only re-added if they still exist on disk. Non-file buffers (help, quickfix, scratch) are intentionally skipped to avoid various edge cases.
 
+## Workspace Locking & Detached Mode
+
+- jjws writes a per-workspace lock file next to the layout snapshot (`~/.local/state/nvim/jjws_lock_<hash>.lock`) so you don’t accidentally open the same JJ workspace in two Neovim instances. Locks record the holding PID; stale locks are automatically deleted if the recorded process is gone (or obviously not Neovim).
+- Locked workspaces show a `(!locked)` marker in the picker. The active workspace in the current Neovim session never shows the marker because you already own that lock.
+- When you try to open a locked workspace you’ll be prompted with two numbered choices: `1. Cancel` (stay in the picker) or `2. Open without agent`. Choosing the second option enters **detached mode**, i.e. edit-only access without claiming the lock.
+- Detached mode skips agent windows entirely, does not restore or save layouts, and never writes lock files. You can still edit files, but you won’t see the embedded agent terminal or have your layout remembered for that workspace. Leave and re-enter once the other Neovim exits to regain full behavior.
+- Locks are released automatically whenever you switch away from a workspace or exit Neovim, so there’s no manual cleanup needed during normal use.
+
 ## Agent Behavior
 
 - **Placement** – Controlled by `agent_position`. `"bottom"`/`"top"` use horizontal splits, `"left"`/`"right"` use vertical splits. Defaults to a right-hand vertical split (`agent_size = 40`). `agent_size` is reused as the height or width depending on orientation (`agent_height` is still accepted for backward compatibility).
