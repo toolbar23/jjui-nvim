@@ -163,6 +163,7 @@ local picker_state = {}
 local active_workspace = nil
 local agent_autocmds = {}
 local agent_buffers = {}
+local agent_sizes = {}
 local pending_agent_sessions = {}
 local workspace_attention = {}
 
@@ -659,6 +660,12 @@ local function hide_agent_buffer(buf, opts)
   local wins = vim.fn.win_findbuf(buf)
   for _, win in ipairs(wins) do
     if vim.api.nvim_win_is_valid(win) then
+      if ok_key and buf_key then
+        local size = agent_window_size(win)
+        if size then
+          agent_sizes[buf_key] = size
+        end
+      end
       vim.api.nvim_win_call(win, function()
         pcall(vim.cmd, "stopinsert")
       end)
@@ -673,6 +680,36 @@ local function hide_agent_buffer(buf, opts)
     end
   end
   return true
+end
+
+local function agent_orientation(pos)
+  pos = (pos or cfg.agent_position or "right"):lower()
+  if pos == "left" or pos == "right" then
+    return "vertical"
+  end
+  return "horizontal"
+end
+
+local function agent_window_size(win)
+  if not win or not vim.api.nvim_win_is_valid(win) then
+    return nil
+  end
+  local orientation = agent_orientation()
+  if orientation == "vertical" then
+    return vim.api.nvim_win_get_width(win)
+  else
+    return vim.api.nvim_win_get_height(win)
+  end
+end
+
+local function remember_agent_size(key, win)
+  if not key or not win then
+    return
+  end
+  local size = agent_window_size(win)
+  if size and size > 0 then
+    agent_sizes[key] = size
+  end
 end
 
 local function ensure_picker_highlights()
@@ -1826,6 +1863,28 @@ local function save_workspace_layout(ctx)
     agent = agent_state.open and agent_state or nil,
   }
 
+  local key = workspace_key(ctx)
+  local agent_layout = nil
+  if key then
+    local size = agent_sizes[key]
+    if agent_state.open and agent_state.buf then
+      local wins = vim.fn.win_findbuf(agent_state.buf)
+      if wins[1] and vim.api.nvim_win_is_valid(wins[1]) then
+        size = agent_window_size(wins[1]) or size
+      end
+    end
+    if size and size > 0 then
+      agent_sizes[key] = size
+      agent_layout = {
+        size = size,
+        position = (cfg.agent_position or "right"),
+      }
+    end
+  end
+  if agent_layout then
+    data.layout = { agent = agent_layout }
+  end
+
   local dir = vim.fn.fnamemodify(layout_path, ":h")
   vim.fn.mkdir(dir, "p")
   local f = io.open(layout_path, "w")
@@ -1904,12 +1963,23 @@ local function restore_workspace_layout(ctx)
     end
   end
 
+  local agent_layout = data.layout and data.layout.agent or nil
+  if agent_layout and agent_layout.size and ctx then
+    local key = workspace_key(ctx)
+    if key then
+      agent_sizes[key] = agent_layout.size
+    end
+  end
+
   if type(data.agent) == "table" and data.agent.open then
     local revived = revive_agent_buffer(ctx)
     if not revived then
       local opts = {}
       if data.agent.session then
         opts.session_id = data.agent.session
+      end
+      if agent_layout and agent_layout.size then
+        opts.size_override = agent_layout.size
       end
       open_agent(opts)
     end
@@ -2593,9 +2663,9 @@ local function set_cwd(path)
   notify("cwd → " .. path)
 end
 
-local function create_agent_split()
-  local size = cfg.agent_size or cfg.agent_height or 40
-  local position = cfg.agent_position
+local function create_agent_split(size_override, position_override)
+  local size = size_override or cfg.agent_size or cfg.agent_height or 40
+  local position = position_override or cfg.agent_position
   if not position or position == "" then
     -- backward compatibility with deprecated agent_direction
     local direction = cfg.agent_direction
@@ -2632,6 +2702,12 @@ local function focus_agent_window(buf)
       vim.api.nvim_set_current_win(win)
       configure_agent_window(win)
       attach_agent_autocmds(buf)
+      local ok_key, key = pcall(function()
+        return vim.b[buf].jjws_workspace_key
+      end)
+      if ok_key and key then
+        remember_agent_size(key, win)
+      end
       pcall(vim.cmd, "startinsert")
       return true
     end
@@ -2639,8 +2715,9 @@ local function focus_agent_window(buf)
   return false
 end
 
-local function place_agent_buffer(buf)
-  local win = create_agent_split()
+local function place_agent_buffer(buf, key)
+  local size_override = key and agent_sizes[key] or nil
+  local win = create_agent_split(size_override)
   vim.api.nvim_win_set_buf(win, buf)
   configure_agent_window(win)
   pcall(vim.api.nvim_buf_set_option, buf, "buflisted", false)
@@ -2648,6 +2725,7 @@ local function place_agent_buffer(buf)
   pcall(vim.api.nvim_buf_set_option, buf, "swapfile", false)
   attach_agent_autocmds(buf)
   pcall(vim.cmd, "startinsert")
+  remember_agent_size(key, win)
   return buf
 end
 
@@ -2661,7 +2739,7 @@ revive_agent_buffer = function(ctx)
     vim.b[buf].jjws_workspace_key = key
     ensure_agent_buffer_watchers(buf, ctx)
     if not focus_agent_window(buf) then
-      place_agent_buffer(buf)
+      place_agent_buffer(buf, key)
     end
     return buf
   end
@@ -2675,6 +2753,7 @@ revive_agent_buffer = function(ctx)
       force_new = true,
       ignore_guard = true,
       visible = false,
+      size_override = agent_sizes[key],
     })
   end
   return nil
@@ -2695,7 +2774,9 @@ open_agent = function(opts)
     end
   end
   local cwd = (ctx and ctx.root) or vim.fn.getcwd()
-  local win = create_agent_split()
+  local key = workspace_key(ctx)
+  local size_pref = opts.size_override or (key and agent_sizes[key])
+  local win = create_agent_split(size_pref)
   vim.cmd("enew")
   local buf = vim.api.nvim_get_current_buf()
   vim.b[buf].jjws_agent = true
@@ -2704,7 +2785,6 @@ open_agent = function(opts)
   pcall(vim.api.nvim_buf_set_option, buf, "swapfile", false)
   pcall(vim.api.nvim_buf_set_option, buf, "filetype", "jjws-agent")
   attach_agent_autocmds(buf)
-  local key = workspace_key(ctx)
   if key then
     vim.b[buf].jjws_workspace_key = key
     agent_buffers[key] = buf
@@ -2757,6 +2837,9 @@ open_agent = function(opts)
   end
 
   -- Persist the updated layout so the agent/session are recorded immediately.
+  if key then
+    remember_agent_size(key, win)
+  end
   if ctx then
     save_workspace_layout(ctx)
   end
