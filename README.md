@@ -1,6 +1,8 @@
 # jjws.nvim
 
-Neovim helpers for juggling multiple Jujutsu workspaces. The plugin keeps track of every workspace you care about, remembers your per-workspace editor state, and wraps an auxiliary “agent” terminal so you can bounce between branches without losing context.
+Neovim helpers for juggling multiple Jujutsu workspaces for agentic coding with OpenAI's CODEX.
+
+The plugin keeps track of every workspace you care about, remembers your per-workspace editor state, and wraps an auxiliary “agent” terminal so you can bounce between branches without losing context.
 
 ## What It Does
 
