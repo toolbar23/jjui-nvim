@@ -4,6 +4,9 @@ local M = {}
 local open_agent
 local diff_refresh
 local diff_comment
+local refresh_picker
+local agent_command_started
+local strip_ansi
 
 local diff_state = {
   buf = nil,
@@ -147,21 +150,51 @@ local cfg = {
   diff_comment_keymap = "gc",
   diff_comment_prefix = "[JJDiff]",
   remember_last = true, -- save last workspace per repo
+  agent_idle_ms = 600, -- ms of silence before we consider the response complete
+  agent_prompt_patterns = nil, -- optional list of Lua patterns to detect prompts
 }
 
 local picker_ns = vim.api.nvim_create_namespace("jjws-picker")
 local ui_state = {
   initial_restored = false,
 }
+local picker_state = {}
+local active_workspace = nil
 local agent_autocmds = {}
 local agent_buffers = {}
 local pending_agent_sessions = {}
+local workspace_attention = {}
 
-local function workspace_key(ctx)
-  if not ctx or not ctx.repo or not ctx.name then
+local AGENT_IDLE_FALLBACK = 600
+local agent_output_watchers = {}
+local agent_key_state = {
+  ns = vim.api.nvim_create_namespace("jjws-agent-key"),
+  handler_active = false,
+  buffers = {},
+}
+
+local function workspace_key_parts(repo, name)
+  if not repo or repo == "" or not name or name == "" then
     return nil
   end
-  return ctx.repo .. "::" .. ctx.name
+  return repo .. "::" .. name
+end
+
+local function workspace_key(ctx)
+  if type(ctx) ~= "table" then
+    return nil
+  end
+  return workspace_key_parts(ctx.repo, ctx.name)
+end
+
+local function workspace_label(ctx)
+  if not ctx then
+    return "workspace"
+  end
+  if ctx.repo and ctx.name then
+    return string.format("%s/%s", ctx.repo, ctx.name)
+  end
+  return ctx.name or (ctx.root or "workspace")
 end
 
 local function set_default_highlight(name, opts)
@@ -170,6 +203,392 @@ local function set_default_highlight(name, opts)
     return
   end
   vim.api.nvim_set_hl(0, name, opts)
+end
+
+local function workspace_snapshot(ctx)
+  if not ctx then
+    return nil
+  end
+  return {
+    repo = ctx.repo,
+    name = ctx.name,
+    root = ctx.root,
+    repo_path = ctx.repo_path,
+    default_root = ctx.default_root,
+  }
+end
+
+local function stamp_agent_workspace(buf, ctx)
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then
+    return
+  end
+  local snapshot = workspace_snapshot(ctx)
+  if snapshot then
+    vim.b[buf].jjws_workspace_snapshot = snapshot
+  end
+end
+
+local function agent_buffer_workspace(buf)
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then
+    return nil
+  end
+  local ok_snapshot, snapshot = pcall(function()
+    return vim.b[buf].jjws_workspace_snapshot
+  end)
+  if ok_snapshot and snapshot then
+    return snapshot
+  end
+  local ok_key, key = pcall(function()
+    return vim.b[buf].jjws_workspace_key
+  end)
+  if ok_key and key then
+    local ctx = active_workspace
+    if ctx and workspace_key(ctx) == key then
+      return ctx
+    end
+  end
+  return nil
+end
+
+local function attention_picker_refresh()
+  if picker_state and picker_state.win and vim.api.nvim_win_is_valid(picker_state.win) then
+    refresh_picker()
+  end
+end
+
+local function workspace_has_attention(repo, name)
+  local key = workspace_key_parts(repo, name)
+  if not key then
+    return false
+  end
+  local state = workspace_attention[key]
+  return state and state.pending or false
+end
+
+local function mark_workspace_attention(ctx, payload)
+  local key = workspace_key(ctx)
+  if not key then
+    return false
+  end
+  local active_key = active_workspace and workspace_key(active_workspace) or nil
+  if active_key and active_key == key then
+    workspace_attention[key] = nil
+    attention_picker_refresh()
+    return false
+  end
+  workspace_attention[key] = {
+    pending = true,
+    last_event = payload,
+    last_command = payload and payload.command or nil,
+    message = payload and payload.message or nil,
+  }
+  attention_picker_refresh()
+  return true
+end
+
+local function clear_workspace_attention(ctx)
+  local key = workspace_key(ctx)
+  if not key then
+    return false
+  end
+  local state = workspace_attention[key]
+  if not state then
+    return false
+  end
+  workspace_attention[key] = nil
+  attention_picker_refresh()
+  return true, state
+end
+
+local default_prompt_patterns = {
+  "codex>%s*$",
+  "%$%s*$",
+  "#%s*$",
+  "[%]%)]%s*$",
+  ">%s*$",
+}
+
+local function get_agent_prompt_patterns()
+  if type(cfg.agent_prompt_patterns) == "table" and #cfg.agent_prompt_patterns > 0 then
+    return cfg.agent_prompt_patterns
+  end
+  return default_prompt_patterns
+end
+
+local function agent_idle_timeout()
+  local timeout = tonumber(cfg.agent_idle_ms)
+  if timeout and timeout > 0 then
+    return timeout
+  end
+  return AGENT_IDLE_FALLBACK
+end
+
+local function stop_agent_idle_timer(state)
+  if state and state.timer then
+    state.timer:stop()
+    state.timer:close()
+    state.timer = nil
+  end
+end
+
+local function detect_prompt_in_lines(lines)
+  if not lines then
+    return false
+  end
+  local patterns = get_agent_prompt_patterns()
+  for idx = #lines, 1, -1 do
+    local line = lines[idx]
+    if line and line ~= "" then
+      local stripped = trim(strip_ansi(line))
+      if stripped ~= "" then
+        for _, pattern in ipairs(patterns) do
+          if stripped:match(pattern) then
+            return true
+          end
+        end
+        break
+      end
+    end
+  end
+  return false
+end
+
+local function agent_completion_message(ctx, command)
+  local label = workspace_label(ctx)
+  if command and command ~= "" then
+    return string.format("agent finished (%s): %s", label, command)
+  end
+  return string.format("agent finished (%s)", label)
+end
+
+local function agent_command_ready(buf, reason)
+  local state = agent_output_watchers[buf]
+  if not state or not state.awaiting_ready then
+    return
+  end
+  local command = state.pending_command
+  state.pending_command = nil
+  state.awaiting_ready = false
+  stop_agent_idle_timer(state)
+  local ctx = agent_buffer_workspace(buf)
+  if not ctx then
+    return
+  end
+  local message = agent_completion_message(ctx, command)
+  notify(message)
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = "JJWSAgentReady",
+    modeline = false,
+    data = {
+      workspace = ctx,
+      command = command,
+      reason = reason,
+    },
+  })
+  mark_workspace_attention(ctx, {
+    command = command,
+    message = message,
+    reason = reason,
+  })
+end
+
+local function schedule_agent_idle_timer(buf, state)
+  if not state then
+    return
+  end
+  stop_agent_idle_timer(state)
+  local timeout = agent_idle_timeout()
+  if timeout <= 0 or not state.awaiting_ready then
+    return
+  end
+  local timer = vim.loop.new_timer()
+  state.timer = timer
+  timer:start(timeout, 0, vim.schedule_wrap(function()
+    state.timer = nil
+    if state.awaiting_ready then
+      agent_command_ready(buf, "idle")
+    end
+  end))
+end
+
+local function handle_agent_output_lines(buf, first, new_last)
+  local state = agent_output_watchers[buf]
+  if not state or not state.awaiting_ready then
+    return
+  end
+  schedule_agent_idle_timer(buf, state)
+  if not (new_last and new_last > first) then
+    return
+  end
+  local ok, lines = pcall(vim.api.nvim_buf_get_lines, buf, first, new_last, false)
+  if not ok or not lines or #lines == 0 then
+    return
+  end
+  if detect_prompt_in_lines(lines) then
+    agent_command_ready(buf, "prompt")
+  end
+end
+
+local function start_agent_output_watch(buf)
+  if agent_output_watchers[buf] then
+    return agent_output_watchers[buf]
+  end
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then
+    return nil
+  end
+  local state = {
+    pending_command = nil,
+    awaiting_ready = false,
+    timer = nil,
+  }
+  agent_output_watchers[buf] = state
+  local ok = vim.api.nvim_buf_attach(buf, false, {
+    on_lines = function(_, b, _, first, _, new_last)
+      handle_agent_output_lines(b or buf, first, new_last)
+    end,
+    on_detach = function()
+      stop_agent_idle_timer(state)
+      agent_output_watchers[buf] = nil
+    end,
+  })
+  if not ok then
+    agent_output_watchers[buf] = nil
+    return nil
+  end
+  return state
+end
+
+local function stop_agent_output_watch(buf)
+  local state = agent_output_watchers[buf]
+  if not state then
+    return
+  end
+  stop_agent_idle_timer(state)
+  agent_output_watchers[buf] = nil
+end
+
+local function reset_agent_key_buffer(buf)
+  local state = agent_key_state.buffers[buf]
+  if state then
+    state.input = ""
+  end
+end
+
+local function handle_agent_key_char(buf, ch)
+  local state = agent_key_state.buffers[buf]
+  if not state or not ch then
+    return
+  end
+  if ch == "\n" then
+    ch = "\r"
+  end
+  if ch == "\r" then
+    local text = trim(state.input or "")
+    if text ~= "" then
+      agent_command_started(buf, text)
+    end
+    state.input = ""
+    return
+  end
+  local byte = string.byte(ch)
+  if not byte then
+    return
+  end
+  if byte == 8 or byte == 127 then
+    local current = state.input or ""
+    if #current > 0 then
+      state.input = current:sub(1, #current - 1)
+    end
+    return
+  end
+  if byte == 21 then -- Ctrl-U
+    state.input = ""
+    return
+  end
+  if byte == 23 then -- Ctrl-W
+    local current = state.input or ""
+    state.input = current:gsub("%s*%S+$", "")
+    return
+  end
+  if byte < 32 then
+    return
+  end
+  state.input = (state.input or "") .. ch
+end
+
+local function ensure_agent_key_listener()
+  if agent_key_state.handler_active then
+    return
+  end
+  agent_key_state.handler_active = true
+  vim.on_key(function(ch)
+    local mode = vim.api.nvim_get_mode().mode
+    if mode ~= "t" then
+      return
+    end
+    local buf = vim.api.nvim_get_current_buf()
+    if not buf or buf == 0 then
+      return
+    end
+    if not agent_key_state.buffers[buf] then
+      return
+    end
+    handle_agent_key_char(buf, ch)
+  end, agent_key_state.ns)
+end
+
+local function start_agent_key_capture(buf)
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then
+    return
+  end
+  if agent_key_state.buffers[buf] then
+    return
+  end
+  agent_key_state.buffers[buf] = { input = "" }
+  ensure_agent_key_listener()
+end
+
+local function stop_agent_key_capture(buf)
+  if buf then
+    agent_key_state.buffers[buf] = nil
+  end
+  if agent_key_state.handler_active and next(agent_key_state.buffers) == nil then
+    vim.on_key(nil, agent_key_state.ns)
+    agent_key_state.handler_active = false
+  end
+end
+
+agent_command_started = function(buf, text)
+  local command = trim(text or "")
+  if command == "" then
+    return
+  end
+  local state = start_agent_output_watch(buf)
+  if not state then
+    return
+  end
+  state.pending_command = command
+  state.awaiting_ready = true
+  schedule_agent_idle_timer(buf, state)
+  local ctx = agent_buffer_workspace(buf)
+  if ctx then
+    vim.api.nvim_exec_autocmds("User", {
+      pattern = "JJWSAgentCommand",
+      modeline = false,
+      data = {
+        workspace = ctx,
+        command = command,
+      },
+    })
+  end
+end
+
+local function ensure_agent_buffer_watchers(buf, ctx)
+  if ctx then
+    stamp_agent_workspace(buf, ctx)
+  end
+  start_agent_key_capture(buf)
+  start_agent_output_watch(buf)
 end
 
 local function is_agent_buffer(buf)
@@ -217,6 +636,7 @@ local function ensure_picker_highlights()
   set_default_highlight("JJWSPickerRepo", { bold = true })
   set_default_highlight("JJWSPickerPath", { link = "Comment" })
   set_default_highlight("JJWSPickerStar", { bold = true })
+  set_default_highlight("JJWSPickerAttention", { link = "WarningMsg" })
   set_default_highlight("JJWSPickerCursorLine", { link = "CursorLine" })
 end
 
@@ -266,6 +686,13 @@ local function attach_agent_autocmds(buf)
     buffer = buf,
     callback = maybe_startinsert,
   })
+  vim.api.nvim_create_autocmd("TermLeave", {
+    group = group,
+    buffer = buf,
+    callback = function()
+      reset_agent_key_buffer(buf)
+    end,
+  })
   vim.api.nvim_create_autocmd("BufHidden", {
     group = group,
     buffer = buf,
@@ -282,6 +709,8 @@ local function attach_agent_autocmds(buf)
     group = group,
     buffer = buf,
     callback = function()
+      stop_agent_key_capture(buf)
+      stop_agent_output_watch(buf)
       local ok_key, buf_key = pcall(function()
         return vim.b[buf].jjws_workspace_key
       end)
@@ -295,6 +724,8 @@ local function attach_agent_autocmds(buf)
     group = group,
     buffer = buf,
     callback = function()
+      stop_agent_key_capture(buf)
+      stop_agent_output_watch(buf)
       local ok_key, key = pcall(function()
         return vim.b[buf].jjws_workspace_key
       end)
@@ -335,6 +766,8 @@ local function attach_agent_autocmds(buf)
     group = group,
     buffer = buf,
     callback = function()
+      stop_agent_key_capture(buf)
+      stop_agent_output_watch(buf)
       local ok_key, key = pcall(function()
         return vim.b[buf].jjws_workspace_key
       end)
@@ -705,7 +1138,7 @@ local function workspace_agent_state(ctx)
   return { open = false }
 end
 
-local function strip_ansi(text)
+strip_ansi = function(text)
   if not text or text == "" then
     return text
   end
@@ -1451,8 +1884,6 @@ ensure_initial_restore = function()
   end
 end
 
-local active_workspace = nil
-
 local function systemlist(cmd, cwd)
   local ok, res = pcall(function()
     return vim.system({ "bash", "-lc", cmd }, { text = true, cwd = cwd }):wait()
@@ -1620,6 +2051,7 @@ local function build_picker_entries()
           path = ctx.root,
           managed = false,
           is_current = true,
+          needs_attention = workspace_has_attention(repo, "default"),
         },
       }
     end
@@ -1629,6 +2061,7 @@ local function build_picker_entries()
         local is_current = canonical and canonical == ctx.root
         ws.is_current = is_current
       end
+      ws.needs_attention = workspace_has_attention(ws.repo, ws.name)
       table.insert(entries, ws)
     end
   end
@@ -1651,12 +2084,26 @@ local function format_picker_lines(entries)
       local connector = indent .. (is_last and branch_last or branch_mid)
       local name = entry.name or ""
       local node_icon = entry.is_current and " " or " "
-      local star = entry.is_current and " *" or ""
-      local label = connector .. node_icon .. name .. star
+      local label = connector .. node_icon .. name
+      local star_start = nil
+      if entry.is_current then
+        label = label .. " *"
+        star_start = #label - 1
+      end
+      local attention_start = nil
+      local attention_len = 0
+      if entry.needs_attention then
+        local attention = " ●"
+        attention_start = #label
+        attention_len = #attention
+        label = label .. attention
+      end
       workspace_label_width = math.max(workspace_label_width, vim.api.nvim_strwidth(label))
       workspace_cache[idx] = {
         label = label,
-        star = star,
+        star_start = star_start,
+        attention_start = attention_start,
+        attention_len = attention_len,
       }
     end
   end
@@ -1697,10 +2144,27 @@ local function format_picker_lines(entries)
         local is_last = not next_entry or next_entry.kind == "repo" or next_entry.repo ~= entry.repo
         local connector = indent .. (is_last and branch_last or branch_mid)
         local node_icon = entry.is_current and " " or " "
-        local star = entry.is_current and " *" or ""
         local name = entry.name or ""
-        label = connector .. node_icon .. name .. star
-        cached = { star = star }
+        label = connector .. node_icon .. name
+        local star_start = nil
+        if entry.is_current then
+          label = label .. " *"
+          star_start = #label - 1
+        end
+        local attention_start = nil
+        local attention_len = 0
+        if entry.needs_attention then
+          local attention = " ●"
+          attention_start = #label
+          attention_len = #attention
+          label = label .. attention
+        end
+        cached = {
+          label = label,
+          star_start = star_start,
+          attention_start = attention_start,
+          attention_len = attention_len,
+        }
       end
       local path = entry.path or ""
       local line_text = label
@@ -1720,11 +2184,17 @@ local function format_picker_lines(entries)
         end
       end
       local segments = {}
-      if cached and cached.star and cached.star ~= "" then
-        local star_start = #label - 1
-        if star_start >= 0 then
-          table.insert(segments, { hl = "JJWSPickerStar", start_col = star_start, end_col = #label })
-        end
+      if cached and cached.star_start then
+        local star_start = cached.star_start
+        table.insert(segments, { hl = "JJWSPickerStar", start_col = star_start, end_col = star_start + 1 })
+      end
+      if cached and cached.attention_start and cached.attention_len and cached.attention_len > 0 then
+        local start_col = cached.attention_start
+        table.insert(segments, {
+          hl = "JJWSPickerAttention",
+          start_col = start_col,
+          end_col = start_col + cached.attention_len,
+        })
       end
       if path_start_col then
         table.insert(segments, { hl = "JJWSPickerPath", start_col = path_start_col, end_col = #line_text })
@@ -1738,8 +2208,6 @@ local function format_picker_lines(entries)
   end
   return lines, max_width, highlights
 end
-
-local picker_state = {}
 
 local function close_picker()
   if picker_state.win and vim.api.nvim_win_is_valid(picker_state.win) then
@@ -2147,8 +2615,9 @@ revive_agent_buffer = function(ctx)
   local buf = agent_buffers[key]
   if buf and vim.api.nvim_buf_is_valid(buf) then
     vim.b[buf].jjws_workspace_key = key
+    ensure_agent_buffer_watchers(buf, ctx)
     if not focus_agent_window(buf) then
-      return place_agent_buffer(buf)
+      place_agent_buffer(buf)
     end
     return buf
   end
@@ -2196,6 +2665,7 @@ open_agent = function(opts)
     vim.b[buf].jjws_workspace_key = key
     agent_buffers[key] = buf
   end
+  ensure_agent_buffer_watchers(buf, ctx)
   local session_id = opts.session_id
   local base_cmd = resolved_agent_cmd()
   if not base_cmd then
@@ -2322,6 +2792,11 @@ function M.use_workspace(ws)
   if new_ctx then
     active_workspace = new_ctx
     restore_workspace_layout(new_ctx)
+    local cleared, state = clear_workspace_attention(new_ctx)
+    if cleared then
+      local message = (state and state.message) or string.format("agent has finished in %s", workspace_label(new_ctx))
+      notify(message)
+    end
   else
     active_workspace = nil
   end
