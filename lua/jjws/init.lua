@@ -150,6 +150,9 @@ local cfg = {
 }
 
 local picker_ns = vim.api.nvim_create_namespace("jjws-picker")
+local ui_state = {
+  initial_restored = false,
+}
 local agent_autocmds = {}
 local agent_buffers = {}
 local pending_agent_sessions = {}
@@ -727,6 +730,17 @@ local function configure_diff_window(win)
   pcall(vim.api.nvim_win_set_option, win, "relativenumber", false)
 end
 
+local function configure_agent_window(win)
+  if not is_valid_win(win) then
+    return
+  end
+  pcall(vim.api.nvim_win_set_option, win, "number", false)
+  pcall(vim.api.nvim_win_set_option, win, "relativenumber", false)
+  pcall(vim.api.nvim_win_set_option, win, "signcolumn", "no")
+  pcall(vim.api.nvim_win_set_option, win, "foldcolumn", "0")
+  pcall(vim.api.nvim_win_set_option, win, "winhighlight", "Normal:Normal,FloatBorder:Normal")
+end
+
 local function diff_split_command()
   local position = (cfg.diff_position or "right"):lower()
   local size = cfg.diff_size
@@ -1302,6 +1316,7 @@ local function create_codex_session(cwd, launcher_cmd)
 end
 
 local revive_agent_buffer
+local ensure_initial_restore
 
 local function save_workspace_layout(ctx)
   if not ctx or not ctx.name then
@@ -1421,6 +1436,18 @@ local function restore_workspace_layout(ctx)
       end
       open_agent(opts)
     end
+  end
+end
+
+ensure_initial_restore = function()
+  if ui_state.initial_restored then
+    return
+  end
+  ui_state.initial_restored = true
+  local ok, ctx = pcall(current_workspace)
+  if ok and ctx then
+    active_workspace = ctx
+    restore_workspace_layout(ctx)
   end
 end
 
@@ -2079,7 +2106,9 @@ local function create_agent_split()
     cmd = string.format("botright %d split", size)
   end
   vim.cmd(cmd)
-  return vim.api.nvim_get_current_win()
+  local win = vim.api.nvim_get_current_win()
+  configure_agent_window(win)
+  return win
 end
 
 local function focus_agent_window(buf)
@@ -2089,6 +2118,7 @@ local function focus_agent_window(buf)
   for _, win in ipairs(vim.api.nvim_list_wins()) do
     if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf then
       vim.api.nvim_set_current_win(win)
+      configure_agent_window(win)
       attach_agent_autocmds(buf)
       pcall(vim.cmd, "startinsert")
       return true
@@ -2100,6 +2130,7 @@ end
 local function place_agent_buffer(buf)
   local win = create_agent_split()
   vim.api.nvim_win_set_buf(win, buf)
+  configure_agent_window(win)
   pcall(vim.api.nvim_buf_set_option, buf, "buflisted", false)
   pcall(vim.api.nvim_buf_set_option, buf, "bufhidden", "hide")
   pcall(vim.api.nvim_buf_set_option, buf, "swapfile", false)
@@ -2372,6 +2403,15 @@ function M.setup(opts)
       end
     end,
   })
+
+  if vim.v.vim_did_enter == 1 then
+    ensure_initial_restore()
+  else
+    vim.api.nvim_create_autocmd("VimEnter", {
+      once = true,
+      callback = ensure_initial_restore,
+    })
+  end
 
   for _, name in ipairs({ "bdelete", "Bdelete", "bd", "Bd" }) do
     vim.cmd(string.format(
