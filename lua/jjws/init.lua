@@ -7,6 +7,7 @@ local diff_comment
 local refresh_picker
 local agent_command_started
 local strip_ansi
+local is_agent_buffer
 
 local diff_state = {
   buf = nil,
@@ -558,6 +559,47 @@ local function stop_agent_key_capture(buf)
   end
 end
 
+local function agent_term_job(buf)
+  if not (buf and vim.api.nvim_buf_is_valid(buf)) then
+    return nil
+  end
+  local ok_job, job = pcall(vim.api.nvim_buf_get_var, buf, "jjws_agent_job")
+  if ok_job and type(job) == "number" and job > 0 then
+    return job
+  end
+  local fallback = vim.fn.getbufvar(buf, "terminal_job_id", 0)
+  if type(fallback) == "number" and fallback > 0 then
+    return fallback
+  end
+  return nil
+end
+
+local function agent_send_escape(buf)
+  local job = agent_term_job(buf)
+  if not job then
+    return false
+  end
+  pcall(vim.fn.chansend, job, "\27")
+  return true
+end
+
+local function apply_agent_keymaps(buf)
+  if not (buf and vim.api.nvim_buf_is_valid(buf) and is_agent_buffer(buf)) then
+    return
+  end
+  if vim.b[buf].jjws_agent_keymaps then
+    return
+  end
+  local opts = { buffer = buf, silent = true }
+  vim.keymap.set("t", "<Esc>", [[<C-\><C-n>]], opts)
+  vim.keymap.set("t", "<S-Esc>", function()
+    if not agent_send_escape(buf) then
+      notify("agent terminal is not ready to receive <Esc>", vim.log.levels.WARN)
+    end
+  end, opts)
+  vim.b[buf].jjws_agent_keymaps = true
+end
+
 agent_command_started = function(buf, text)
   local command = trim(text or "")
   if command == "" then
@@ -589,9 +631,10 @@ local function ensure_agent_buffer_watchers(buf, ctx)
   end
   start_agent_key_capture(buf)
   start_agent_output_watch(buf)
+  apply_agent_keymaps(buf)
 end
 
-local function is_agent_buffer(buf)
+is_agent_buffer = function(buf)
   if not buf or not vim.api.nvim_buf_is_valid(buf) then
     return false
   end
@@ -675,6 +718,7 @@ local function attach_agent_autocmds(buf)
     if not ok or not is_agent then
       return
     end
+    apply_agent_keymaps(buf)
     vim.schedule(function()
       if vim.api.nvim_buf_is_valid(buf) then
         pcall(vim.cmd, "startinsert")
