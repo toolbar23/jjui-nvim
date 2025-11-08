@@ -383,6 +383,8 @@ function Picker.setup(env)
     return picker_state.entries and picker_state.entries[idx] or nil
   end
 
+  local switch_from_picker
+
   local function open_picker_window()
     picker_state.entries = build_picker_entries()
     local ctx = current_workspace()
@@ -475,7 +477,7 @@ function Picker.setup(env)
     end
   end
 
-  local function switch_from_picker(entry)
+  switch_from_picker = function(entry)
     if not entry then
       return false
     end

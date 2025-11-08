@@ -124,6 +124,82 @@ local function picker_attention_refresh()
   end
 end
 
+local function workspace_key_parts(repo, name)
+  if not repo or repo == "" or not name or name == "" then
+    return nil
+  end
+  return repo .. "::" .. name
+end
+
+local function workspace_key(ctx)
+  if type(ctx) ~= "table" then
+    return nil
+  end
+  return workspace_key_parts(ctx.repo, ctx.name)
+end
+
+local function workspace_label(ctx)
+  if not ctx then
+    return "workspace"
+  end
+  if ctx.repo and ctx.name then
+    return string.format("%s/%s", ctx.repo, ctx.name)
+  end
+  return ctx.name or (ctx.root or "workspace")
+end
+
+local function set_default_highlight(name, opts)
+  local ok, current = pcall(vim.api.nvim_get_hl, 0, { name = name, link = false })
+  if ok and current and not vim.tbl_isempty(current) then
+    return
+  end
+  vim.api.nvim_set_hl(0, name, opts)
+end
+
+local function workspace_snapshot(ctx)
+  if not ctx then
+    return nil
+  end
+  return {
+    repo = ctx.repo,
+    name = ctx.name,
+    root = ctx.root,
+    repo_path = ctx.repo_path,
+    default_root = ctx.default_root,
+  }
+end
+
+local function current_workspace()
+  local root = workspace_root_from_jj()
+  if not root then
+    return nil
+  end
+  local canonical_root = canonical_path(root) or root
+  local repo_path = repo_storage_path(canonical_root)
+  local repo = repo_from_root(canonical_root)
+  local default_root = repo_default_root(repo_path)
+  local name, info = find_workspace(repo, canonical_root)
+  if not name then
+    local workspace_name = vim.fn.fnamemodify(canonical_root, ":t")
+    if default_root and canonical_root == default_root then
+      name = "default"
+    else
+      name = workspace_name ~= "" and workspace_name or "default"
+    end
+    info = { path = canonical_root }
+  end
+  return {
+    root = canonical_root,
+    repo = repo,
+    repo_path = repo_path,
+    name = name,
+    info = info,
+    default_root = default_root,
+    raw_root = root,
+    workspace_name = vim.fn.fnamemodify(canonical_root, ":t"),
+  }
+end
+
 local function is_valid_buf(buf)
   return type(buf) == "number" and buf > 0 and vim.api.nvim_buf_is_valid(buf)
 end

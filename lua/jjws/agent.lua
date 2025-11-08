@@ -16,6 +16,7 @@ function Agent.setup(env)
   local save_workspace_layout = env.save_workspace_layout
 
   local uv = vim.uv or vim.loop
+  local fn = vim.fn
 
   local agent_autocmds = {}
   local agent_buffers = {}
@@ -763,15 +764,31 @@ function Agent.setup(env)
     return false
   end
 
-  local function build_codex_resume_command(session_id, agent_cmd)
+  local function shellescape_path(path)
+    if path and path ~= "" then
+      local ok, escaped = pcall(fn.shellescape, path)
+      if ok and escaped and escaped ~= "" then
+        return escaped
+      end
+    end
+    return "$(pwd)"
+  end
+
+  local function codex_cd_flag(cwd)
+    return "--cd " .. shellescape_path(cwd)
+  end
+
+  local function build_codex_resume_command(session_id, agent_cmd, cwd)
     if not session_id or session_id == "" then
       return nil
     end
     local cmd = agent_cmd or cfg.agent_cmd
+    local cd_flag = codex_cd_flag(cwd)
     if type(cmd) == "table" and cmd[1] == "bash" and cmd[2] == "-lc" then
-      return format_session_command({ "bash", "-lc", "codex resume %s" }, session_id)
+      return format_session_command({ "bash", "-lc", string.format("codex %s --search resume %%s", cd_flag) }, session_id)
     end
-    return format_session_command({ "codex", "resume", "%s" }, session_id)
+    local cd_arg = cwd or fn.getcwd()
+    return format_session_command({ "codex", "--cd", cd_arg, "--search", "resume", "%s" }, session_id)
   end
 
   local function resolved_agent_type()
@@ -792,7 +809,7 @@ function Agent.setup(env)
     return resolved_agent_type() == "codex"
   end
 
-  local function resolved_agent_cmd()
+  local function resolved_agent_cmd(cwd)
     local cmd = cfg.agent_cmd
     if type(cmd) == "function" then
       local ok, result = pcall(cmd)
@@ -807,12 +824,13 @@ function Agent.setup(env)
     end
     local agent_type = resolved_agent_type() or "codex"
     if agent_type == "codex" then
-      return { "bash", "-lc", "codex --repo $(pwd)" }
+      local cd_flag = codex_cd_flag(cwd)
+      return { "bash", "-lc", string.format("codex %s --search", cd_flag) }
     end
     return nil
   end
 
-  local function resolved_agent_session_cmd()
+  local function resolved_agent_session_cmd(cwd)
     local cmd = cfg.agent_session_cmd
     if type(cmd) == "function" then
       local ok, result = pcall(cmd)
@@ -826,12 +844,13 @@ function Agent.setup(env)
       return clone_cmd(cmd)
     end
     if is_codex_agent() then
-      return { "bash", "-lc", [[codex exec "say ready"]] }
+      local cd_flag = codex_cd_flag(cwd)
+      return { "bash", "-lc", string.format([[codex %s --search exec "say ready"]], cd_flag) }
     end
     return nil
   end
 
-  local function build_resume_command(session_id, base_cmd)
+  local function build_resume_command(session_id, base_cmd, cwd)
     if not session_id or session_id == "" then
       return nil
     end
@@ -847,7 +866,7 @@ function Agent.setup(env)
       return format_session_command(cfg.agent_resume_cmd, session_id)
     end
     if is_codex_agent() then
-      return build_codex_resume_command(session_id, base_cmd)
+      return build_codex_resume_command(session_id, base_cmd, cwd)
     end
     return nil
   end
@@ -1014,23 +1033,23 @@ function Agent.setup(env)
     end
     ensure_agent_buffer_watchers(buf, ctx)
     local session_id = opts.session_id
-    local base_cmd = resolved_agent_cmd()
+    local base_cmd = resolved_agent_cmd(cwd)
     if not base_cmd then
       notify("configure jjws.agent_cmd or jjws.agent_type", vim.log.levels.ERROR)
       return nil
     end
     local term_cmd = base_cmd
     if session_id and session_id ~= "" then
-      local resume_cmd = build_resume_command(session_id, base_cmd)
-      if resume_cmd then
-        term_cmd = resume_cmd
-      end
+      local resume_cmd = build_resume_command(session_id, base_cmd, cwd)
+        if resume_cmd then
+          term_cmd = resume_cmd
+        end
     elseif is_codex_agent() then
-      local session_cmd = resolved_agent_session_cmd()
+      local session_cmd = resolved_agent_session_cmd(cwd)
       local session, err = create_codex_session(cwd, session_cmd)
       if session then
         session_id = session
-        local resume_cmd = build_resume_command(session_id, base_cmd)
+        local resume_cmd = build_resume_command(session_id, base_cmd, cwd)
         if resume_cmd then
           term_cmd = resume_cmd
           notify("codex session " .. session_id .. " ready", vim.log.levels.DEBUG)
