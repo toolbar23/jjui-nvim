@@ -23,10 +23,15 @@ function Picker.setup(env)
   local current_workspace = env.current_workspace
   local use_workspace = env.use_workspace
   local META_KEY = env.META_KEY
+  local collect_repo_workspaces = env.collect_repo_workspaces or function()
+    return {}
+  end
+  local known_repos = env.known_repos or function()
+    return {}, {}, current_workspace()
+  end
 
   local picker_ns = vim.api.nvim_create_namespace("jjws-picker")
   local picker_state = {}
-  local missing_repo_dirs_warned = {}
   local ensured_highlights = false
 
   local function ensure_picker_highlights()
@@ -40,125 +45,6 @@ function Picker.setup(env)
     set_default_highlight("JJWSPickerLocked", { link = "WarningMsg" })
     set_default_highlight("JJWSPickerCursorLine", { link = "CursorLine" })
     ensured_highlights = true
-  end
-
-  local function systemlist(cmd, cwd)
-    local ok, res = pcall(function()
-      return vim.system({ "bash", "-lc", cmd }, { text = true, cwd = cwd }):wait()
-    end)
-
-    if not ok then
-      error(res)
-    end
-
-    if res.code ~= 0 then
-      local err = trim(res.stderr)
-      if err ~= "" then
-        vim.notify(err, vim.log.levels.ERROR)
-      end
-      return nil, err ~= "" and err or ("command failed: " .. cmd)
-    end
-
-    local lines = {}
-    for s in string.gmatch(res.stdout or "", "([^\n]*)\n?") do
-      if s == "" then
-        break
-      end
-      table.insert(lines, s)
-    end
-    return lines, nil
-  end
-
-  local function parse_workspace_names(lines)
-    local items = {}
-    for _, l in ipairs(lines) do
-      local name = trim(l)
-      if name ~= "" then
-        table.insert(items, name)
-      end
-    end
-    return items
-  end
-
-  local function collect_repo_workspaces(repo, opts)
-    opts = opts or {}
-    if not repo or repo == "" then
-      return {}
-    end
-    local items = {}
-    local by_name = {}
-    local repo_path = opts.repo_path
-    local repo_cfg = repo_entry(repo)
-    if repo_cfg then
-      for name, info in pairs(repo_cfg) do
-        if name ~= META_KEY and info and info.path then
-          local path = canonical_path(info.path) or trim(info.path)
-          table.insert(items, {
-            kind = "workspace",
-            repo = repo,
-            name = name,
-            path = path,
-            managed = true,
-            repo_path = repo_path or info.repo_path,
-          })
-          by_name[name] = true
-        end
-      end
-    end
-
-    local cwd = opts.cwd
-    if cwd then
-      if not dir_exists(cwd) then
-        local key = canonical_path(cwd) or cwd
-        if key and not missing_repo_dirs_warned[key] then
-          missing_repo_dirs_warned[key] = true
-          notify(string.format("Skipping jj workspace discovery for %s (missing %s)", repo, cwd), vim.log.levels.WARN)
-        end
-      else
-        local lines = select(1, systemlist(cfg.list_cmd, cwd))
-        if lines then
-          local base = parent_dir(cwd)
-          for _, name in ipairs(parse_workspace_names(lines)) do
-            if not by_name[name] then
-              local ws_path = joinpath(base, name)
-              table.insert(items, {
-                kind = "workspace",
-                repo = repo,
-                name = name,
-                path = canonical_path(ws_path) or ws_path,
-                managed = false,
-                repo_path = repo_path,
-              })
-              by_name[name] = true
-            end
-          end
-        end
-      end
-    end
-
-    table.sort(items, function(a, b)
-      if a.name == b.name then
-        return a.path < b.path
-      end
-      return a.name < b.name
-    end)
-    return items
-  end
-
-  local function known_repos()
-    local repos = {}
-    local seen = {}
-    for repo, _ in pairs(workspace_config()) do
-      table.insert(repos, repo)
-      seen[repo] = true
-    end
-    local ctx = current_workspace()
-    if ctx and ctx.repo and not seen[ctx.repo] then
-      table.insert(repos, ctx.repo)
-      seen[ctx.repo] = true
-    end
-    table.sort(repos)
-    return repos, seen, ctx
   end
 
   local function build_picker_entries()

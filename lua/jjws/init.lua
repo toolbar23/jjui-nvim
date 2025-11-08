@@ -3,17 +3,24 @@ local util = require("jjws.util")
 local config_module = require("jjws.config")
 local diff_module = require("jjws.diff")
 local picker_module = require("jjws.picker")
+local workspace_module = require("jjws.workspace")
+local agent_module = require("jjws.agent")
 
 local M = {}
 
 local open_agent
 local diff_refresh
 local diff_comment
-local refresh_picker
-local agent_command_started
 local picker_api
 local strip_ansi
 local is_agent_buffer
+local hide_agent_buffer
+local attach_agent_autocmds
+local agent_abbrev_target
+local revive_agent_buffer
+local agent_buffers
+local agent_sizes
+local agent_window_size
 
 local function trim(s)
   return util.trim(s)
@@ -27,12 +34,36 @@ local function workspace_root_from_jj(cwd)
   return util.workspace_root_from_jj(cwd)
 end
 
+local function notify(msg, level)
+  return util.notify(msg, level)
+end
+
 local function save_config()
   return config_module.save_config(notify)
 end
 
 local function workspace_config()
   return config_module.workspace_config()
+end
+
+local function canonical_path(path)
+  return util.canonical_path(path)
+end
+
+local function repo_storage_path(root)
+  return config_module.repo_storage_path(root)
+end
+
+local function repo_from_root(root)
+  return config_module.repo_from_root(root)
+end
+
+local function repo_default_root(repo_path)
+  return config_module.repo_default_root(repo_path)
+end
+
+local function find_workspace(repo, path)
+  return config_module.find_workspace(repo, path)
 end
 
 local cfg = {
@@ -83,21 +114,9 @@ local ui_state = {
   initial_restored = false,
 }
 local active_workspace = nil
-local agent_autocmds = {}
-local agent_buffers = {}
-local agent_sizes = {}
-local pending_agent_sessions = {}
-local workspace_attention = {}
-local owned_workspace_lock = nil
 local current_pid = (uv and uv.os_getpid and uv.os_getpid()) or vim.fn.getpid()
 
-local AGENT_IDLE_FALLBACK = 600
-local agent_output_watchers = {}
-local agent_key_state = {
-  ns = vim.api.nvim_create_namespace("jjws-agent-key"),
-  handler_active = false,
-  buffers = {},
-}
+strip_ansi = util.strip_ansi
 
 local function picker_attention_refresh()
   if picker_api and picker_api.attention_refresh then
@@ -105,543 +124,83 @@ local function picker_attention_refresh()
   end
 end
 
-refresh_picker = function(needle)
-  if picker_api and picker_api.refresh then
-    picker_api.refresh(needle)
-  end
+local function is_valid_buf(buf)
+  return type(buf) == "number" and buf > 0 and vim.api.nvim_buf_is_valid(buf)
 end
 
-local function workspace_key_parts(repo, name)
-  if not repo or repo == "" or not name or name == "" then
-    return nil
-  end
-  return repo .. "::" .. name
+local function is_valid_win(win)
+  return type(win) == "number" and win > 0 and vim.api.nvim_win_is_valid(win)
 end
 
-local function workspace_key(ctx)
-  if type(ctx) ~= "table" then
-    return nil
-  end
-  return workspace_key_parts(ctx.repo, ctx.name)
+local function noop()
 end
 
-local function workspace_label(ctx)
-  if not ctx then
-    return "workspace"
-  end
-  if ctx.repo and ctx.name then
-    return string.format("%s/%s", ctx.repo, ctx.name)
-  end
-  return ctx.name or (ctx.root or "workspace")
-end
-
-local function set_default_highlight(name, opts)
-  local ok, current = pcall(vim.api.nvim_get_hl, 0, { name = name, link = false })
-  if ok and current and not vim.tbl_isempty(current) then
-    return
-  end
-  vim.api.nvim_set_hl(0, name, opts)
-end
-
-local function workspace_snapshot(ctx)
-  if not ctx then
-    return nil
-  end
-  return {
-    repo = ctx.repo,
-    name = ctx.name,
-    root = ctx.root,
-    repo_path = ctx.repo_path,
-    default_root = ctx.default_root,
-  }
-end
-
-local function stamp_agent_workspace(buf, ctx)
-  if not (buf and vim.api.nvim_buf_is_valid(buf)) then
-    return
-  end
-  local snapshot = workspace_snapshot(ctx)
-  if snapshot then
-    vim.b[buf].jjws_workspace_snapshot = snapshot
-  end
-end
-
-local function agent_buffer_workspace(buf)
-  if not (buf and vim.api.nvim_buf_is_valid(buf)) then
-    return nil
-  end
-  local ok_snapshot, snapshot = pcall(function()
-    return vim.b[buf].jjws_workspace_snapshot
-  end)
-  if ok_snapshot and snapshot then
-    return snapshot
-  end
-  local ok_key, key = pcall(function()
-    return vim.b[buf].jjws_workspace_key
-  end)
-  if ok_key and key then
-    local ctx = active_workspace
-    if ctx and workspace_key(ctx) == key then
-      return ctx
-    end
-  end
-  return nil
-end
-
-local function workspace_has_attention(repo, name)
-  local key = workspace_key_parts(repo, name)
-  if not key then
-    return false
-  end
-  local state = workspace_attention[key]
-  return state and state.pending or false
-end
-
-local function mark_workspace_attention(ctx, payload)
-  local key = workspace_key(ctx)
-  if not key then
-    return false
-  end
-  local active_key = active_workspace and workspace_key(active_workspace) or nil
-  if active_key and active_key == key then
-    workspace_attention[key] = nil
-    picker_attention_refresh()
-    return false
-  end
-  workspace_attention[key] = {
-    pending = true,
-    last_event = payload,
-    last_command = payload and payload.command or nil,
-    message = payload and payload.message or nil,
-  }
-  picker_attention_refresh()
+local function always_true()
   return true
 end
 
-local function clear_workspace_attention(ctx)
-  local key = workspace_key(ctx)
-  if not key then
-    return false
-  end
-  local state = workspace_attention[key]
-  if not state then
-    return false
-  end
-  workspace_attention[key] = nil
-  picker_attention_refresh()
-  return true, state
+local save_workspace_layout = noop
+local restore_workspace_layout = noop
+local maybe_handle_locked_workspace = always_true
+local acquire_workspace_lock = always_true
+local release_workspace_lock = noop
+local save_last = noop
+local function load_last_stub()
+  return nil
 end
-
-local default_prompt_patterns = {
-  "codex>%s*$",
-  "%$%s*$",
-  "#%s*$",
-  "[%]%)]%s*$",
-  ">%s*$",
-}
-
-local function get_agent_prompt_patterns()
-  if type(cfg.agent_prompt_patterns) == "table" and #cfg.agent_prompt_patterns > 0 then
-    return cfg.agent_prompt_patterns
-  end
-  return default_prompt_patterns
+local load_last = load_last_stub
+local function default_lock_status()
+  return { locked = false }
 end
-
-local function agent_idle_timeout()
-  local timeout = tonumber(cfg.agent_idle_ms)
-  if timeout and timeout > 0 then
-    return timeout
-  end
-  return AGENT_IDLE_FALLBACK
+local workspace_lock_status = default_lock_status
+local function passthrough_ref(ws)
+  return ws
 end
-
-local function stop_agent_idle_timer(state)
-  if state and state.timer then
-    state.timer:stop()
-    state.timer:close()
-    state.timer = nil
-  end
-end
-
-local function detect_prompt_in_lines(lines)
-  if not lines then
-    return false
-  end
-  local patterns = get_agent_prompt_patterns()
-  for idx = #lines, 1, -1 do
-    local line = lines[idx]
-    if line and line ~= "" then
-      local stripped = trim(strip_ansi(line))
-      if stripped ~= "" then
-        for _, pattern in ipairs(patterns) do
-          if stripped:match(pattern) then
-            return true
-          end
-        end
-        break
-      end
-    end
-  end
+local normalize_workspace_ref = passthrough_ref
+local function attention_false()
   return false
 end
-
-local function agent_completion_message(ctx, command)
-  local label = workspace_label(ctx)
-  if command and command ~= "" then
-    return string.format("agent finished (%s): %s", label, command)
-  end
-  return string.format("agent finished (%s)", label)
+local function attention_noop()
+  return false
 end
-
-local function agent_command_ready(buf, reason)
-  local state = agent_output_watchers[buf]
-  if not state or not state.awaiting_ready then
-    return
-  end
-  local command = state.pending_command
-  state.pending_command = nil
-  state.awaiting_ready = false
-  stop_agent_idle_timer(state)
-  local ctx = agent_buffer_workspace(buf)
-  if not ctx then
-    return
-  end
-  local message = agent_completion_message(ctx, command)
-  notify(message)
-  vim.api.nvim_exec_autocmds("User", {
-    pattern = "JJWSAgentReady",
-    modeline = false,
-    data = {
-      workspace = ctx,
-      command = command,
-      reason = reason,
-    },
-  })
-  mark_workspace_attention(ctx, {
-    command = command,
-    message = message,
-    reason = reason,
-  })
+local workspace_has_attention = attention_false
+local mark_workspace_attention = attention_noop
+local clear_workspace_attention = attention_noop
+local function empty_collect_repo_workspaces()
+  return {}
 end
-
-local function schedule_agent_idle_timer(buf, state)
-  if not state then
-    return
-  end
-  stop_agent_idle_timer(state)
-  local timeout = agent_idle_timeout()
-  if timeout <= 0 or not state.awaiting_ready then
-    return
-  end
-  local timer = vim.loop.new_timer()
-  state.timer = timer
-  timer:start(timeout, 0, vim.schedule_wrap(function()
-    state.timer = nil
-    if state.awaiting_ready then
-      agent_command_ready(buf, "idle")
-    end
-  end))
+local collect_repo_workspaces = empty_collect_repo_workspaces
+local function empty_known_repos()
+  return {}, {}, nil
 end
+local known_repos = empty_known_repos
+local ensure_initial_restore
 
-local function handle_agent_output_lines(buf, first, new_last)
-  local state = agent_output_watchers[buf]
-  if not state or not state.awaiting_ready then
+ensure_initial_restore = function()
+  if ui_state.initial_restored then
     return
   end
-  schedule_agent_idle_timer(buf, state)
-  if not (new_last and new_last > first) then
-    return
-  end
-  local ok, lines = pcall(vim.api.nvim_buf_get_lines, buf, first, new_last, false)
-  if not ok or not lines or #lines == 0 then
-    return
-  end
-  if detect_prompt_in_lines(lines) then
-    agent_command_ready(buf, "prompt")
-  end
-end
-
-local function start_agent_output_watch(buf)
-  if agent_output_watchers[buf] then
-    return agent_output_watchers[buf]
-  end
-  if not (buf and vim.api.nvim_buf_is_valid(buf)) then
-    return nil
-  end
-  local state = {
-    pending_command = nil,
-    awaiting_ready = false,
-    timer = nil,
-  }
-  agent_output_watchers[buf] = state
-  local ok = vim.api.nvim_buf_attach(buf, false, {
-    on_lines = function(_, b, _, first, _, new_last)
-      handle_agent_output_lines(b or buf, first, new_last)
-    end,
-    on_detach = function()
-      stop_agent_idle_timer(state)
-      agent_output_watchers[buf] = nil
-    end,
-  })
-  if not ok then
-    agent_output_watchers[buf] = nil
-    return nil
-  end
-  return state
-end
-
-local function stop_agent_output_watch(buf)
-  local state = agent_output_watchers[buf]
-  if not state then
-    return
-  end
-  stop_agent_idle_timer(state)
-  agent_output_watchers[buf] = nil
-end
-
-local function reset_agent_key_buffer(buf)
-  local state = agent_key_state.buffers[buf]
-  if state then
-    state.input = ""
-  end
-end
-
-local function handle_agent_key_char(buf, ch)
-  local state = agent_key_state.buffers[buf]
-  if not state or not ch then
-    return
-  end
-  if ch == "\n" then
-    ch = "\r"
-  end
-  if ch == "\r" then
-    local text = trim(state.input or "")
-    if text ~= "" then
-      agent_command_started(buf, text)
-    end
-    state.input = ""
-    return
-  end
-  local byte = string.byte(ch)
-  if not byte then
-    return
-  end
-  if byte == 8 or byte == 127 then
-    local current = state.input or ""
-    if #current > 0 then
-      state.input = current:sub(1, #current - 1)
-    end
-    return
-  end
-  if byte == 21 then -- Ctrl-U
-    state.input = ""
-    return
-  end
-  if byte == 23 then -- Ctrl-W
-    local current = state.input or ""
-    state.input = current:gsub("%s*%S+$", "")
-    return
-  end
-  if byte < 32 then
-    return
-  end
-  state.input = (state.input or "") .. ch
-end
-
-local function ensure_agent_key_listener()
-  if agent_key_state.handler_active then
-    return
-  end
-  agent_key_state.handler_active = true
-  vim.on_key(function(ch)
-    local mode = vim.api.nvim_get_mode().mode
-    if mode ~= "t" then
-      return
-    end
-    local buf = vim.api.nvim_get_current_buf()
-    if not buf or buf == 0 then
-      return
-    end
-    if not agent_key_state.buffers[buf] then
-      return
-    end
-    handle_agent_key_char(buf, ch)
-  end, agent_key_state.ns)
-end
-
-local function start_agent_key_capture(buf)
-  if not (buf and vim.api.nvim_buf_is_valid(buf)) then
-    return
-  end
-  if agent_key_state.buffers[buf] then
-    return
-  end
-  agent_key_state.buffers[buf] = { input = "" }
-  ensure_agent_key_listener()
-end
-
-local function stop_agent_key_capture(buf)
-  if buf then
-    agent_key_state.buffers[buf] = nil
-  end
-  if agent_key_state.handler_active and next(agent_key_state.buffers) == nil then
-    vim.on_key(nil, agent_key_state.ns)
-    agent_key_state.handler_active = false
-  end
-end
-
-local function agent_term_job(buf)
-  if not (buf and vim.api.nvim_buf_is_valid(buf)) then
-    return nil
-  end
-  local ok_job, job = pcall(vim.api.nvim_buf_get_var, buf, "jjws_agent_job")
-  if ok_job and type(job) == "number" and job > 0 then
-    return job
-  end
-  local fallback = vim.fn.getbufvar(buf, "terminal_job_id", 0)
-  if type(fallback) == "number" and fallback > 0 then
-    return fallback
-  end
-  return nil
-end
-
-local function agent_send_escape(buf)
-  local job = agent_term_job(buf)
-  if not job then
-    return false
-  end
-  pcall(vim.fn.chansend, job, "\27")
-  return true
-end
-
-local function apply_agent_keymaps(buf)
-  if not (buf and vim.api.nvim_buf_is_valid(buf) and is_agent_buffer(buf)) then
-    return
-  end
-  if vim.b[buf].jjws_agent_keymaps then
-    return
-  end
-  local opts = { buffer = buf, silent = true }
-  vim.keymap.set("t", "<Esc>", [[<C-\><C-n>]], opts)
-  vim.keymap.set("t", "<S-Esc>", function()
-    if not agent_send_escape(buf) then
-      notify("agent terminal is not ready to receive <Esc>", vim.log.levels.WARN)
-    end
-  end, opts)
-  vim.b[buf].jjws_agent_keymaps = true
-end
-
-agent_command_started = function(buf, text)
-  local command = trim(text or "")
-  if command == "" then
-    return
-  end
-  local state = start_agent_output_watch(buf)
-  if not state then
-    return
-  end
-  state.pending_command = command
-  state.awaiting_ready = true
-  schedule_agent_idle_timer(buf, state)
-  local ctx = agent_buffer_workspace(buf)
-  if ctx then
-    vim.api.nvim_exec_autocmds("User", {
-      pattern = "JJWSAgentCommand",
-      modeline = false,
-      data = {
-        workspace = ctx,
-        command = command,
-      },
-    })
-  end
-end
-
-local function ensure_agent_buffer_watchers(buf, ctx)
-  if ctx then
-    stamp_agent_workspace(buf, ctx)
-  end
-  start_agent_key_capture(buf)
-  start_agent_output_watch(buf)
-  apply_agent_keymaps(buf)
-end
-
-is_agent_buffer = function(buf)
-  if not buf or not vim.api.nvim_buf_is_valid(buf) then
-    return false
-  end
-  local ok, flag = pcall(vim.api.nvim_buf_get_var, buf, "jjws_agent")
-  return ok and flag and true or false
-end
-
-local function hide_agent_buffer(buf, opts)
-  buf = buf or vim.api.nvim_get_current_buf()
-  if not is_agent_buffer(buf) then
-    return false
-  end
-  opts = opts or {}
-  local ok_key, buf_key = pcall(function()
-    return vim.b[buf].jjws_workspace_key
-  end)
-  if ok_key and buf_key then
-    agent_buffers[buf_key] = buf
-  end
-  pcall(vim.api.nvim_buf_set_option, buf, "buflisted", false)
-  pcall(vim.api.nvim_buf_set_option, buf, "bufhidden", "hide")
-  local wins = vim.fn.win_findbuf(buf)
-  for _, win in ipairs(wins) do
-    if vim.api.nvim_win_is_valid(win) then
-      if ok_key and buf_key then
-        local size = agent_window_size(win)
-        if size then
-          agent_sizes[buf_key] = size
-        end
-      end
-      vim.api.nvim_win_call(win, function()
-        pcall(vim.cmd, "stopinsert")
-      end)
-      local total_wins = #vim.api.nvim_list_wins()
-      if total_wins > 1 and not opts.keep_window then
-        pcall(vim.api.nvim_win_close, win, true)
-      else
-        vim.api.nvim_win_call(win, function()
-          vim.cmd("enew")
-        end)
+  ui_state.initial_restored = true
+  local ok, ctx = pcall(current_workspace)
+  if ok and ctx then
+    ctx.path = ctx.root
+    active_workspace = ctx
+    maybe_handle_locked_workspace(ctx, { allow_prompt = false })
+    if not ctx.detached then
+      local lock_ok = acquire_workspace_lock(ctx)
+      if not lock_ok then
+        ctx.detached = true
+        notify(
+          string.format("%s locked elsewhere; running detached.", workspace_label(ctx)),
+          vim.log.levels.WARN
+        )
       end
     end
-  end
-  return true
-end
-
-local function agent_orientation(pos)
-  pos = (pos or cfg.agent_position or "right"):lower()
-  if pos == "left" or pos == "right" then
-    return "vertical"
-  end
-  return "horizontal"
-end
-
-local function agent_window_size(win)
-  if not win or not vim.api.nvim_win_is_valid(win) then
-    return nil
-  end
-  local orientation = agent_orientation()
-  if orientation == "vertical" then
-    return vim.api.nvim_win_get_width(win)
-  else
-    return vim.api.nvim_win_get_height(win)
+    if not ctx.detached then
+      restore_workspace_layout(ctx)
+    end
   end
 end
-
-local function remember_agent_size(key, win)
-  if not key or not win then
-    return
-  end
-  local size = agent_window_size(win)
-  if size and size > 0 then
-    agent_sizes[key] = size
-  end
-end
-
 
 M._switch_from_picker = function(entry)
   if picker_api and picker_api.switch then
@@ -700,226 +259,6 @@ local function set_cwd(path)
     end)
   end
   notify("cwd → " .. path)
-end
-
-local function create_agent_split(size_override, position_override)
-  local size = size_override or cfg.agent_size or cfg.agent_height or 40
-  local position = position_override or cfg.agent_position
-  if not position or position == "" then
-    -- backward compatibility with deprecated agent_direction
-    local direction = cfg.agent_direction
-    if direction == "vertical" or direction == "vert" then
-      position = "right"
-    else
-      position = "bottom"
-    end
-  end
-  position = position:lower()
-  local cmd
-  if position == "top" then
-    cmd = string.format("topleft %d split", size)
-  elseif position == "left" then
-    cmd = string.format("topleft %d vsplit", size)
-  elseif position == "right" then
-    cmd = string.format("botright %d vsplit", size)
-  else
-    position = "bottom"
-    cmd = string.format("botright %d split", size)
-  end
-  vim.cmd(cmd)
-  local win = vim.api.nvim_get_current_win()
-  configure_agent_window(win)
-  return win
-end
-
-local function focus_agent_window(buf)
-  if not (buf and vim.api.nvim_buf_is_valid(buf)) then
-    return false
-  end
-  for _, win in ipairs(vim.api.nvim_list_wins()) do
-    if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf then
-      vim.api.nvim_set_current_win(win)
-      configure_agent_window(win)
-      attach_agent_autocmds(buf)
-      local ok_key, key = pcall(function()
-        return vim.b[buf].jjws_workspace_key
-      end)
-      if ok_key and key then
-        remember_agent_size(key, win)
-      end
-      pcall(vim.cmd, "startinsert")
-      return true
-    end
-  end
-  return false
-end
-
-local function place_agent_buffer(buf, key)
-  local size_override = key and agent_sizes[key] or nil
-  local win = create_agent_split(size_override)
-  vim.api.nvim_win_set_buf(win, buf)
-  configure_agent_window(win)
-  pcall(vim.api.nvim_buf_set_option, buf, "buflisted", false)
-  pcall(vim.api.nvim_buf_set_option, buf, "bufhidden", "hide")
-  pcall(vim.api.nvim_buf_set_option, buf, "swapfile", false)
-  attach_agent_autocmds(buf)
-  pcall(vim.cmd, "startinsert")
-  remember_agent_size(key, win)
-  return buf
-end
-
-revive_agent_buffer = function(ctx)
-  if ctx and ctx.detached then
-    return nil
-  end
-  local key = workspace_key(ctx)
-  if not key then
-    return nil
-  end
-  local buf = agent_buffers[key]
-  if buf and vim.api.nvim_buf_is_valid(buf) then
-    vim.b[buf].jjws_workspace_key = key
-    ensure_agent_buffer_watchers(buf, ctx)
-    if not focus_agent_window(buf) then
-      place_agent_buffer(buf, key)
-    end
-    return buf
-  end
-  agent_buffers[key] = nil
-  local pending = pending_agent_sessions[key]
-  if pending then
-    pending_agent_sessions[key] = nil
-    return open_agent({
-      workspace = ctx,
-      session_id = pending,
-      force_new = true,
-      ignore_guard = true,
-      visible = false,
-      size_override = agent_sizes[key],
-    })
-  end
-  return nil
-end
-
-open_agent = function(opts)
-  -- Open a terminal split and start the configured agent in repo cwd
-  opts = opts or {}
-  local ctx = opts.workspace or active_workspace or current_workspace()
-  if not ctx and not opts.ignore_guard then
-    notify("open a JJ workspace before starting the agent", vim.log.levels.WARN)
-    return nil
-  end
-  if ctx and ctx.detached then
-    notify("workspace is in detached mode; agent disabled", vim.log.levels.WARN)
-    return nil
-  end
-  if not opts.force_new then
-    local revived = revive_agent_buffer(ctx)
-    if revived then
-      return revived
-    end
-  end
-  local cwd = (ctx and ctx.root) or vim.fn.getcwd()
-  local key = workspace_key(ctx)
-  local size_pref = opts.size_override or (key and agent_sizes[key])
-  local win = create_agent_split(size_pref)
-  vim.cmd("enew")
-  local buf = vim.api.nvim_get_current_buf()
-  vim.b[buf].jjws_agent = true
-  pcall(vim.api.nvim_buf_set_option, buf, "buflisted", false)
-  pcall(vim.api.nvim_buf_set_option, buf, "bufhidden", "hide")
-  pcall(vim.api.nvim_buf_set_option, buf, "swapfile", false)
-  pcall(vim.api.nvim_buf_set_option, buf, "filetype", "jjws-agent")
-  attach_agent_autocmds(buf)
-  if key then
-    vim.b[buf].jjws_workspace_key = key
-    agent_buffers[key] = buf
-  end
-  ensure_agent_buffer_watchers(buf, ctx)
-  local session_id = opts.session_id
-  local base_cmd = resolved_agent_cmd()
-  if not base_cmd then
-    notify("configure jjws.agent_cmd or jjws.agent_type", vim.log.levels.ERROR)
-    return nil
-  end
-  local term_cmd = base_cmd
-  if session_id and session_id ~= "" then
-    local resume_cmd = build_resume_command(session_id, base_cmd)
-    if resume_cmd then
-      term_cmd = resume_cmd
-    end
-  elseif is_codex_agent() then
-    local session_cmd = resolved_agent_session_cmd()
-    local session, err = create_codex_session(cwd, session_cmd)
-    if session then
-      session_id = session
-      local resume_cmd = build_resume_command(session_id, base_cmd)
-      if resume_cmd then
-        term_cmd = resume_cmd
-        notify("codex session " .. session_id .. " ready", vim.log.levels.DEBUG)
-      end
-    elseif err then
-      notify("codex session setup failed: " .. err, vim.log.levels.WARN)
-    end
-  end
-
-  local job_id = vim.fn.termopen(term_cmd, { cwd = cwd })
-  if opts.visible ~= false then
-    vim.cmd("startinsert")
-  else
-    vim.schedule(function()
-      if win and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf then
-        pcall(vim.api.nvim_win_close, win, true)
-      end
-    end)
-  end
-  if type(job_id) == "number" and job_id > 0 then
-    pcall(vim.api.nvim_buf_set_var, buf, "jjws_agent_job", job_id)
-  end
-  if session_id and session_id ~= "" then
-    vim.b[buf].jjws_codex_session = session_id
-  else
-    vim.b[buf].jjws_codex_session = nil
-  end
-
-  -- Persist the updated layout so the agent/session are recorded immediately.
-  if key then
-    remember_agent_size(key, win)
-  end
-  if ctx then
-    save_workspace_layout(ctx)
-  end
-
-  return buf
-end
-
-local function statefile(repo_root)
-  return vim.fn.stdpath("state") .. "/jjws_last_" .. vim.fn.sha256(repo_root) .. ".json"
-end
-
-local function save_last(repo_root, ws)
-  if not cfg.remember_last then
-    return
-  end
-  local path = statefile(repo_root)
-  local data = vim.json.encode(ws)
-  vim.fn.mkdir(vim.fn.fnamemodify(path, ":h"), "p")
-  local f = io.open(path, "w")
-  if f then
-    f:write(data)
-    f:close()
-  end
-end
-
-local function load_last(repo_root)
-  local path = statefile(repo_root)
-  local f = io.open(path, "r")
-  if not f then
-    return nil
-  end
-  local ok, data = pcall(vim.json.decode, f:read("*a"))
-  f:close()
-  return ok and data or nil
 end
 
 function M.list_workspaces(repo)
@@ -1028,6 +367,134 @@ end
 
 function M.setup(opts)
   cfg = vim.tbl_deep_extend("force", cfg, opts or {})
+
+  local agent_api = agent_module.setup({
+    cfg = cfg,
+    notify = notify,
+    trim = trim,
+    strip_ansi = strip_ansi,
+    clone_cmd = util.clone_cmd,
+    normalize_system_cmd = util.normalize_system_cmd,
+    workspace_label = workspace_label,
+    workspace_snapshot = workspace_snapshot,
+    workspace_key = workspace_key,
+    mark_workspace_attention = function(...)
+      return mark_workspace_attention(...)
+    end,
+    get_active_workspace = function()
+      return active_workspace
+    end,
+    current_workspace = current_workspace,
+    save_workspace_layout = function(...)
+      return save_workspace_layout(...)
+    end,
+  })
+
+  open_agent = agent_api.open
+  hide_agent_buffer = agent_api.hide
+  is_agent_buffer = agent_api.is_agent_buffer
+  attach_agent_autocmds = agent_api.attach_autocmds
+  revive_agent_buffer = agent_api.revive
+  agent_buffers = agent_api.buffers
+  agent_sizes = agent_api.sizes
+  agent_window_size = agent_api.window_size
+  agent_abbrev_target = agent_api.abbrev_target
+
+  local workspace_api = workspace_module.setup({
+    cfg = cfg,
+    notify = notify,
+    trim = trim,
+    workspace_label = workspace_label,
+    workspace_key = workspace_key,
+    canonical_path = canonical_path,
+    repo_storage_path = repo_storage_path,
+    repo_default_root = repo_default_root,
+    workspace_config = workspace_config,
+    repo_entry = config_module.repo_entry,
+    dir_exists = util.dir_exists,
+    joinpath = joinpath,
+    parent_dir = util.parent_dir,
+    META_KEY = config_module.META_KEY,
+    agent_buffers = agent_buffers,
+    agent_sizes = agent_sizes,
+    agent_window_size = agent_window_size,
+    open_agent = open_agent,
+    revive_agent_buffer = revive_agent_buffer,
+    current_pid = current_pid,
+    uv = uv,
+    attention_refresh = picker_attention_refresh,
+    get_active_workspace = function()
+      return active_workspace
+    end,
+    current_workspace = current_workspace,
+  })
+
+  normalize_workspace_ref = workspace_api.normalize_workspace_ref
+  workspace_lock_status = workspace_api.workspace_lock_status
+  acquire_workspace_lock = workspace_api.acquire_lock
+  release_workspace_lock = workspace_api.release_lock
+  maybe_handle_locked_workspace = workspace_api.maybe_handle_locked_workspace
+  save_workspace_layout = workspace_api.save_layout
+  restore_workspace_layout = workspace_api.restore_layout
+  save_last = workspace_api.save_last
+  load_last = workspace_api.load_last
+  workspace_has_attention = workspace_api.has_attention
+  mark_workspace_attention = workspace_api.mark_attention
+  clear_workspace_attention = workspace_api.clear_attention
+  collect_repo_workspaces = workspace_api.collect_repo_workspaces
+  known_repos = workspace_api.known_repos
+
+  picker_api = picker_module.setup({
+    cfg = cfg,
+    notify = notify,
+    trim = trim,
+    set_default_highlight = set_default_highlight,
+    workspace_config = workspace_config,
+    repo_entry = config_module.repo_entry,
+    update_workspace = function(repo, name, path, repo_path)
+      return config_module.update_workspace(repo, name, path, repo_path, notify)
+    end,
+    delete_workspace = function(repo, name)
+      return config_module.delete_workspace(repo, name, notify)
+    end,
+    repo_any_path = config_module.repo_any_path,
+    repo_default_root = repo_default_root,
+    find_workspace = find_workspace,
+    repo_storage_path = repo_storage_path,
+    dir_exists = util.dir_exists,
+    joinpath = joinpath,
+    parent_dir = util.parent_dir,
+    canonical_path = canonical_path,
+    workspace_has_attention = workspace_has_attention,
+    normalize_workspace_ref = normalize_workspace_ref,
+    workspace_lock_status = workspace_lock_status,
+    current_workspace = current_workspace,
+    use_workspace = function(ws, picker_opts)
+      return M.use_workspace(ws, picker_opts)
+    end,
+    META_KEY = config_module.META_KEY,
+    collect_repo_workspaces = collect_repo_workspaces,
+    known_repos = known_repos,
+  })
+
+  local diff_api = diff_module.setup({
+    cfg = cfg,
+    notify = notify,
+    trim = trim,
+    strip_ansi = strip_ansi,
+    is_valid_buf = is_valid_buf,
+    is_valid_win = is_valid_win,
+    workspace_key = workspace_key,
+    current_workspace = current_workspace,
+    get_active_workspace = function()
+      return active_workspace
+    end,
+    open_agent = open_agent,
+    agent_buffers = agent_buffers,
+    attach_agent_autocmds = attach_agent_autocmds,
+  })
+  diff_refresh = diff_api.refresh
+  diff_comment = diff_api.comment
   vim.api.nvim_create_user_command("JJWSAgentHide", function(o)
     if hide_agent_buffer() then
       return
