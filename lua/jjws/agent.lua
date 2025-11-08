@@ -349,6 +349,69 @@ function Agent.setup(env)
     return nil
   end
 
+  local function desired_agent_cols()
+    local cols = tonumber(cfg.agent_term_cols)
+    if cols and cols > 0 then
+      return math.max(1, math.floor(cols))
+    end
+    return nil
+  end
+
+  local function agent_window_height(buf)
+    local wins = fn.win_findbuf(buf)
+    for _, win in ipairs(wins) do
+      if vim.api.nvim_win_is_valid(win) then
+        local ok_height, height = pcall(vim.api.nvim_win_get_height, win)
+        if ok_height and type(height) == "number" and height > 0 then
+          return height
+        end
+      end
+    end
+    local fallback = tonumber(vim.o.lines) or 0
+    if fallback <= 0 then
+      fallback = 40
+    end
+    return fallback
+  end
+
+  local function enforce_agent_job_size(buf)
+    local cols = desired_agent_cols()
+    if not cols then
+      return
+    end
+    local job = agent_term_job(buf)
+    if not job then
+      return
+    end
+    local height = agent_window_height(buf)
+    if height < 2 then
+      height = 2
+    end
+    pcall(fn.jobresize, job, cols, height)
+    if vim.api.nvim_buf_is_valid(buf) then
+      vim.b[buf].jjws_agent_term_cols = cols
+    end
+  end
+
+  local function enforce_all_agent_sizes()
+    for buf in pairs(agent_autocmds) do
+      if vim.api.nvim_buf_is_valid(buf) then
+        enforce_agent_job_size(buf)
+      end
+    end
+  end
+
+  local agent_term_size_group = vim.api.nvim_create_augroup("JJWSAgentTermSize", { clear = true })
+  vim.api.nvim_create_autocmd("VimResized", {
+    group = agent_term_size_group,
+    callback = function()
+      if not desired_agent_cols() then
+        return
+      end
+      enforce_all_agent_sizes()
+    end,
+  })
+
   local function agent_send_escape(buf)
     local job = agent_term_job(buf)
     if not job then
@@ -522,6 +585,7 @@ function Agent.setup(env)
         return
       end
       apply_agent_keymaps(buf)
+      enforce_agent_job_size(buf)
       vim.schedule(function()
         if vim.api.nvim_buf_is_valid(buf) then
           pcall(vim.cmd, "startinsert")
@@ -1071,6 +1135,7 @@ function Agent.setup(env)
     end
     if type(job_id) == "number" and job_id > 0 then
       pcall(vim.api.nvim_buf_set_var, buf, "jjws_agent_job", job_id)
+      enforce_agent_job_size(buf)
     end
     if session_id and session_id ~= "" then
       vim.b[buf].jjws_codex_session = session_id

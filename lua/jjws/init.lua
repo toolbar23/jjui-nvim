@@ -97,6 +97,7 @@ local cfg = {
   agent_resume_cmd = nil, -- override the resume command (accepts %s placeholder)
   agent_size = 40, -- split size (height or width depending on position)
   agent_position = "right", -- "bottom", "top", "left", or "right"
+  agent_term_cols = 40, -- terminal column count reported to the agent
   diff_command = { "bash", "-lc", "jj diff -tool difftastic --color=always" },
   diff_position = "right",
   diff_size = nil,
@@ -179,7 +180,9 @@ local function current_workspace()
   local repo = repo_from_root(canonical_root)
   local default_root = repo_default_root(repo_path)
   local name, info = find_workspace(repo, canonical_root)
+  local registered = true
   if not name then
+    registered = false
     local workspace_name = vim.fn.fnamemodify(canonical_root, ":t")
     if default_root and canonical_root == default_root then
       name = "default"
@@ -197,6 +200,7 @@ local function current_workspace()
     default_root = default_root,
     raw_root = root,
     workspace_name = vim.fn.fnamemodify(canonical_root, ":t"),
+    unregistered = not registered,
   }
 end
 
@@ -258,7 +262,7 @@ ensure_initial_restore = function()
   end
   ui_state.initial_restored = true
   local ok, ctx = pcall(current_workspace)
-  if ok and ctx then
+  if ok and ctx and not ctx.unregistered then
     ctx.path = ctx.root
     active_workspace = ctx
     maybe_handle_locked_workspace(ctx, { allow_prompt = false })
