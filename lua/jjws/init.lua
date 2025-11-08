@@ -97,8 +97,8 @@ local cfg = {
   agent_resume_cmd = nil, -- override the resume command (accepts %s placeholder)
   agent_size = 40, -- split size (height or width depending on position)
   agent_position = "right", -- "bottom", "top", "left", or "right"
-  agent_term_cols = 40, -- terminal column count reported to the agent
-  diff_command = { "bash", "-lc", "jj diff -tool difftastic --color=always" },
+  agent_term_cols = 80, -- terminal column count reported to the agent
+  diff_command = { "bash", "-lc", "jj diff" },
   diff_position = "right",
   diff_size = nil,
   diff_refresh_keymap = "gr",

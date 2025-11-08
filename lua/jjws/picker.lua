@@ -30,7 +30,8 @@ function Picker.setup(env)
     return {}, {}, current_workspace()
   end
 
-  local picker_ns = vim.api.nvim_create_namespace("jjws-picker")
+local picker_ns = vim.api.nvim_create_namespace("jjws-picker")
+local picker_help_text = "Enter: switch  r:register  w:create  d:delete  Esc:close"
   local picker_state = {}
   local ensured_highlights = false
 
@@ -318,8 +319,14 @@ function Picker.setup(env)
     end
     ensure_picker_highlights()
     local lines, _, highlights = format_picker_lines(picker_state.entries)
+    local display_lines = {}
+    for _, line in ipairs(lines) do
+      table.insert(display_lines, line)
+    end
+    table.insert(display_lines, "")
+    table.insert(display_lines, picker_help_text)
     vim.api.nvim_buf_set_option(picker_state.buf, "modifiable", true)
-    vim.api.nvim_buf_set_lines(picker_state.buf, 0, -1, false, lines)
+    vim.api.nvim_buf_set_lines(picker_state.buf, 0, -1, false, display_lines)
     vim.api.nvim_buf_set_option(picker_state.buf, "modifiable", false)
     vim.api.nvim_buf_clear_namespace(picker_state.buf, picker_ns, 0, -1)
     for idx, segments in ipairs(highlights or {}) do
@@ -331,6 +338,8 @@ function Picker.setup(env)
         end
       end
     end
+    local legend_idx = #display_lines
+    pcall(vim.api.nvim_buf_add_highlight, picker_state.buf, picker_ns, "JJWSPickerPath", legend_idx - 1, 0, -1)
   end
 
   local function find_entry_index(target)
@@ -384,6 +393,10 @@ function Picker.setup(env)
   end
 
   local switch_from_picker
+  local ensure_picker_open
+  local register_repo
+  local create_workspace
+  local remove_workspace
 
   local function open_picker_window()
     picker_state.entries = build_picker_entries()
@@ -441,8 +454,6 @@ function Picker.setup(env)
       end
     end, { buffer = buf, nowait = true })
 
-    vim.keymap.set("n", "q", close_picker, { buffer = buf, nowait = true })
-
     vim.keymap.set("n", "r", function()
       ensure_picker_open()
       register_repo()
@@ -453,7 +464,7 @@ function Picker.setup(env)
       create_workspace()
     end, { buffer = buf, nowait = true })
 
-    vim.keymap.set("n", "x", function()
+    vim.keymap.set("n", "d", function()
       ensure_picker_open()
       remove_workspace()
     end, { buffer = buf, nowait = true })
@@ -463,7 +474,7 @@ function Picker.setup(env)
     vim.api.nvim_buf_set_option(buf, "modifiable", false)
   end
 
-  local function ensure_picker_open()
+  ensure_picker_open = function()
     if not picker_state.win or not vim.api.nvim_win_is_valid(picker_state.win) then
       open_picker_window()
     end
@@ -543,7 +554,7 @@ function Picker.setup(env)
     return true
   end
 
-  local function register_repo()
+  register_repo = function()
     local ctx = current_workspace()
     if not ctx or not ctx.repo then
       notify("not inside a jj workspace", vim.log.levels.WARN)
@@ -559,7 +570,7 @@ function Picker.setup(env)
     refresh_picker({ kind = "repo", repo = ctx.repo })
   end
 
-  local function create_workspace()
+  create_workspace = function()
     local ctx = current_workspace()
     if not ctx or not ctx.repo or not ctx.root then
       notify("not inside a jj workspace", vim.log.levels.WARN)
@@ -590,7 +601,7 @@ function Picker.setup(env)
     refresh_picker({ kind = "workspace", repo = ctx.repo, name = name })
   end
 
-  local function remove_workspace()
+  remove_workspace = function()
     local entry = current_picker_entry()
     if not entry or entry.kind ~= "workspace" then
       notify("select a workspace first", vim.log.levels.WARN)

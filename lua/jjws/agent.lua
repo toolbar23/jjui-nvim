@@ -387,8 +387,21 @@ function Agent.setup(env)
     if height < 2 then
       height = 2
     end
+    local previous = nil
+    if vim.api.nvim_buf_is_valid(buf) then
+      local ok_prev, stored = pcall(function()
+        return vim.b[buf].jjws_agent_term_size
+      end)
+      if ok_prev then
+        previous = stored
+      end
+    end
+    if previous and previous.cols == cols and previous.height == height then
+      return
+    end
     pcall(fn.jobresize, job, cols, height)
     if vim.api.nvim_buf_is_valid(buf) then
+      vim.b[buf].jjws_agent_term_size = { cols = cols, height = height }
       vim.b[buf].jjws_agent_term_cols = cols
     end
   end

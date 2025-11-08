@@ -38,37 +38,29 @@ function M.setup(env)
     pcall(vim.api.nvim_win_set_option, win, "winhighlight", "Normal:Normal,FloatBorder:Normal")
   end
 
-  local function diff_split_command()
-    local position = (cfg.diff_position or "right"):lower()
-    local size = cfg.diff_size
-    if position == "left" then
-      if size then
-        return string.format("topleft %d vsplit", size)
-      end
-      return "topleft vsplit"
-    elseif position == "top" then
-      if size then
-        return string.format("topleft %d split", size)
-      end
-      return "topleft split"
-    elseif position == "bottom" then
-      if size then
-        return string.format("botright %d split", size)
-      end
-      return "botright split"
-    end
-    if size then
-      return string.format("botright %d vsplit", size)
-    end
-    return "botright vsplit"
-  end
-
-  local function ensure_diff_window()
-    if is_valid_win(state.win) then
+  local function current_diff_window()
+    if is_valid_win(state.win) and vim.api.nvim_win_get_buf(state.win) == state.buf then
       return state.win
     end
-    vim.cmd(diff_split_command())
-    local win = vim.api.nvim_get_current_win()
+    if not is_valid_buf(state.buf) then
+      state.win = nil
+      return nil
+    end
+    for _, win in ipairs(vim.api.nvim_list_wins()) do
+      if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == state.buf then
+        state.win = win
+        return win
+      end
+    end
+    state.win = nil
+    return nil
+  end
+
+  local function assign_diff_to_window(win)
+    if not (is_valid_buf(state.buf) and is_valid_win(win)) then
+      return nil
+    end
+    vim.api.nvim_win_set_buf(win, state.buf)
     configure_diff_window(win)
     state.win = win
     return win
@@ -92,15 +84,15 @@ function M.setup(env)
   end
 
   local function ensure_diff_buffer()
-    local win = ensure_diff_window()
     if not is_valid_buf(state.buf) then
       local buf = vim.api.nvim_create_buf(false, true)
-      vim.api.nvim_buf_set_option(buf, "bufhidden", "wipe")
+      vim.api.nvim_buf_set_option(buf, "bufhidden", "hide")
+      vim.api.nvim_buf_set_option(buf, "buflisted", true)
       vim.api.nvim_buf_set_option(buf, "buftype", "nofile")
       vim.api.nvim_buf_set_option(buf, "swapfile", false)
       vim.api.nvim_buf_set_option(buf, "modifiable", false)
       vim.api.nvim_buf_set_option(buf, "filetype", "jjwsdiff")
-      vim.api.nvim_win_set_buf(win, buf)
+      pcall(vim.api.nvim_buf_set_name, buf, "JJWS AGENT DIFF")
       local chan = vim.api.nvim_open_term(buf, {})
       state.buf = buf
       state.chan = chan
@@ -112,11 +104,24 @@ function M.setup(env)
           reset_state()
         end,
       })
-    elseif vim.api.nvim_win_get_buf(win) ~= state.buf then
-      vim.api.nvim_win_set_buf(win, state.buf)
     end
-    configure_diff_window(win)
-    return state.buf, state.chan, win
+    return state.buf, state.chan
+  end
+
+  local function ensure_diff_visible(preferred_win)
+    if not is_valid_buf(state.buf) then
+      return nil
+    end
+    local win = current_diff_window()
+    if win then
+      configure_diff_window(win)
+      return win
+    end
+    local target = preferred_win
+    if not is_valid_win(target) then
+      target = vim.api.nvim_get_current_win()
+    end
+    return assign_diff_to_window(target)
   end
 
   local function active_workspace()
@@ -278,7 +283,7 @@ function M.setup(env)
     if output:sub(-1) ~= "\n" then
       output = output .. "\n"
     end
-    local buf, chan, win = ensure_diff_buffer()
+    local buf, chan = ensure_diff_buffer()
     if not buf or type(chan) ~= "number" or chan <= 0 then
       notify("unable to initialise diff buffer", vim.log.levels.ERROR)
       return
@@ -289,8 +294,10 @@ function M.setup(env)
         vim.api.nvim_set_current_win(prev_win)
       end
     else
-      if win and vim.api.nvim_win_is_valid(win) then
-        vim.api.nvim_set_current_win(win)
+      local preferred = current_diff_window() or prev_win
+      local target_win = ensure_diff_visible(preferred)
+      if target_win and vim.api.nvim_win_is_valid(target_win) then
+        vim.api.nvim_set_current_win(target_win)
       end
     end
   end
@@ -363,8 +370,8 @@ function M.setup(env)
       notify("open a JJ diff buffer before adding comments", vim.log.levels.WARN)
       return
     end
-    local win = state.win
-    if not is_valid_win(win) or vim.api.nvim_win_get_buf(win) ~= state.buf then
+    local win = current_diff_window()
+    if not win then
       win = vim.api.nvim_get_current_win()
     end
     local selection = gather_diff_selection(state.buf, win, opts)
@@ -395,8 +402,9 @@ function M.setup(env)
         return
       end
       notify("diff comment sent to agent", vim.log.levels.INFO)
-      if state.win and vim.api.nvim_win_is_valid(state.win) then
-        vim.api.nvim_set_current_win(state.win)
+      local diff_win = current_diff_window()
+      if diff_win then
+        vim.api.nvim_set_current_win(diff_win)
       end
     end)
   end
